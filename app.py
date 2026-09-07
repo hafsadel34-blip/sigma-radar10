@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-📡⚛️ SigmaRadar v1.2 – بدون pandas_ta/numba (يعمل على Python 3.14)
+📡⚛️ SigmaRadar v1.3 – مع سجلات تشخيصية مفصلة
 """
 
 import asyncio
@@ -43,7 +43,7 @@ ACTIVE_FILE = "sigma_active.json"
 app = Flask(__name__)
 is_scanning = False
 
-# ═══════════════ حساب المؤشرات يدوياً (بدون pandas_ta) ═══════════════
+# ═══════════════ حساب المؤشرات يدوياً ═══════════════
 def calc_rsi(close, period=14):
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -53,13 +53,11 @@ def calc_rsi(close, period=14):
     return rsi
 
 def calc_adx(high, low, close, period=14):
-    # True Range
     tr1 = high - low
     tr2 = abs(high - close.shift())
     tr3 = abs(low - close.shift())
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr = tr.rolling(window=period).mean()
-    # Directional Movement
     up_move = high.diff()
     down_move = -low.diff()
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
@@ -159,17 +157,21 @@ class SigmaRadar:
 
     async def fetch_btc(self):
         try:
+            print("  📡 جلب بيانات BTC...")
             ticker = await self.exchange.fetch_ticker('BTC/USDT')
             change = ticker.get('percentage', 0.0)
             if change > 1.0: regime = "BULL"
             elif change < -1.0: regime = "BEAR"
             else: regime = "NEUTRAL"
+            print(f"  ✅ BTC: {change:+.2f}% | {regime}")
             return regime, change
-        except:
+        except Exception as e:
+            print(f"  ❌ فشل جلب BTC: {e}")
             return "NEUTRAL", 0.0
 
     async def get_symbols(self, limit=300):
         try:
+            print("  📡 جلب قائمة العملات من KuCoin...")
             tickers = await self.exchange.fetch_tickers()
             symbols = []
             for sym, t in tickers.items():
@@ -178,21 +180,26 @@ class SigmaRadar:
                 if t.get('quoteVolume', 0) >= MIN_VOLUME:
                     symbols.append(sym)
             symbols.sort(key=lambda s: tickers[s]['quoteVolume'], reverse=True)
+            print(f"  ✅ تم جلب {len(symbols)} عملة (أخذ أول {limit})")
             return symbols[:limit]
-        except:
+        except Exception as e:
+            print(f"  ❌ فشل جلب العملات: {e}")
             return []
 
     async def analyze(self, symbol: str, regime: str):
         try:
+            print(f"    🔍 تحليل {symbol}...", end=' ')
             ohlcv_1h, ohlcv_1d = await asyncio.gather(
                 self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200),
                 self.exchange.fetch_ohlcv(symbol, timeframe='1d', limit=90)
             )
-            if not ohlcv_1h or len(ohlcv_1h) < 50: return None
+            if not ohlcv_1h or len(ohlcv_1h) < 50:
+                print("❌ بيانات غير كافية")
+                return None
             df = pd.DataFrame(ohlcv_1h, columns=['time','open','high','low','close','vol'])
             df_daily = pd.DataFrame(ohlcv_1d, columns=['time','open','high','low','close','vol']) if ohlcv_1d else pd.DataFrame()
 
-            # حساب المؤشرات يدوياً
+            # حساب المؤشرات
             df['RSI'] = calc_rsi(df['close'])
             df['StochK'] = calc_stoch_rsi(df['close'])
             df['ADX'] = calc_adx(df['high'], df['low'], df['close'])
@@ -204,18 +211,20 @@ class SigmaRadar:
             name = symbol.split('/')[0]
 
             if self.memory.is_blocked(name, cmf_1h):
+                print("⛔ محظور")
                 return None
             if self.memory.is_active(name):
+                print("🔄 نشط")
                 return None
 
             ticker = await self.exchange.fetch_ticker(symbol)
             change_24h = ticker.get('percentage', 0.0)
             volume_24h = ticker.get('quoteVolume', 0)
 
-            rsi = df['RSI'].iloc[-1]
-            stoch_k = df['StochK'].iloc[-1]
-            adx = df['ADX'].iloc[-1]
-            atr = df['ATR'].iloc[-1]
+            rsi = df['RSI'].iloc[-1] if not pd.isna(df['RSI'].iloc[-1]) else 50
+            stoch_k = df['StochK'].iloc[-1] if not pd.isna(df['StochK'].iloc[-1]) else 50
+            adx = df['ADX'].iloc[-1] if not pd.isna(df['ADX'].iloc[-1]) else 0
+            atr = df['ATR'].iloc[-1] if not pd.isna(df['ATR'].iloc[-1]) else price * 0.02
             atr_pct = (atr / price) * 100 if price > 0 else 2.0
 
             # Drawdown
@@ -227,14 +236,12 @@ class SigmaRadar:
             elif dd >= 15: zone = '⚪ تصحيح طبيعي'
             else: zone = '🔴 قريب من القمة'
 
-            # Alpha Composite (تقريبي)
             returns = df['close'].pct_change()
             mom = returns.rolling(20).mean().iloc[-1] if len(returns) >= 20 else 0
             sma20 = df['close'].rolling(20).mean().iloc[-1] if len(df) >= 20 else price
             mr = (price - sma20) / sma20 if sma20 > 0 else 0
             alpha = (mom * 100) - (mr * 50)
 
-            # VWAP Deviation
             if len(df) >= 20:
                 typical = (df['high'] + df['low'] + df['close']) / 3
                 vp = typical * df['vol']
@@ -261,7 +268,9 @@ class SigmaRadar:
             if adx > 25: score += 10; signals.append(f"ADX قوي {adx:.1f}")
             if atr_pct > 3: score += 5
 
-            if score < MIN_SCORE: return None
+            if score < MIN_SCORE:
+                print(f"❌ نقاط منخفضة ({score})")
+                return None
 
             sl_pct = max(2.0, min(15.0, atr_pct * 1.5))
             tp1_pct = max(3.0, min(25.0, atr_pct * 2.0))
@@ -272,7 +281,9 @@ class SigmaRadar:
             sl = price * (1 - sl_pct/100)
 
             rr = (tp2_pct / sl_pct) if sl_pct > 0 else 0
-            if rr < MIN_RR: return None
+            if rr < MIN_RR:
+                print(f"❌ R/R منخفض ({rr:.1f})")
+                return None
 
             # حفظ في التتبع
             self.memory.save_active(name, {
@@ -285,6 +296,7 @@ class SigmaRadar:
                 'signals': signals[:4], 'score': score
             })
 
+            print(f"✅ نقاط {score}")
             return {
                 'symbol': name, 'score': score, 'price': price,
                 'change_24h': change_24h, 'volume_24h': volume_24h,
@@ -297,10 +309,11 @@ class SigmaRadar:
                 'signals': signals[:4]
             }
         except Exception as e:
-            logger.debug(f"خطأ {symbol}: {e}")
+            print(f"⚠️ خطأ: {e}")
             return None
 
     async def track_active_signals(self):
+        print("  🔍 تتبع الصفقات المفتوحة...")
         for symbol, data in list(self.memory.active.items()):
             if data.get('status') == 'closed':
                 continue
@@ -333,29 +346,36 @@ class SigmaRadar:
 
     async def hunt(self):
         print("\n" + "="*60)
-        print("  📡⚛️ SigmaRadar v1.2 (بدون pandas_ta)")
+        print("  📡⚛️ SigmaRadar v1.3 (تشخيصي)")
         print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("="*60)
 
+        print("  🔍 تتبع الصفقات المفتوحة...")
         await self.track_active_signals()
 
         regime, btc_change = await self.fetch_btc()
         print(f"  Market: {regime} | BTC: {btc_change:+.2f}%")
-        symbols = await self.get_symbols(300)
-        if not symbols: return
 
+        symbols = await self.get_symbols(300)
+        if not symbols:
+            print("  ❌ لا توجد عملات! تحقق من الاتصال بـ KuCoin.")
+            return
+
+        print(f"  🔍 تحليل {len(symbols)} عملة...")
         tasks = [self.analyze(sym, regime) for sym in symbols]
         results = await asyncio.gather(*tasks)
         results = [r for r in results if r is not None]
         results.sort(key=lambda x: -x['score'])
         top = results[:TOP_N]
         if not top:
-            print("  No signals.")
+            print("  📭 لا توجد فرص (جميع العملات رُفضت).")
             return
 
+        print(f"  ✅ تم العثور على {len(top)} فرصة!")
         msg = f"📡⚛️ *توصيات SigmaRadar الكمّية* — {datetime.now().strftime('%H:%M')}\n"
         msg += f"{'─'*30}\n"
         msg += f"السوق: {regime} | BTC: {btc_change:+.2f}%\n"
-        msg += f"أفضل {len(top)} فرص تم رصدها (بعد فلترة الذاكرة)\n"
+        msg += f"أفضل {len(top)} فرص تم رصدها\n"
         msg += f"{'─'*30}\n\n"
 
         for i, s in enumerate(top, 1):
@@ -373,6 +393,7 @@ class SigmaRadar:
             msg += f"{'─'*30}\n\n"
 
         await self.send_telegram(msg)
+        print("  ✅ تم إرسال التوصيات إلى تليجرام.")
 
 # ═══════════════ نقاط النهاية Flask ═══════════════
 def run_hunt_background():
@@ -401,7 +422,7 @@ def run_hunt_background():
 
 @app.route('/')
 def home():
-    return "📡⚛️ SigmaRadar v1.2 يعمل (بدون pandas_ta)!", 200
+    return "📡⚛️ SigmaRadar v1.3 (تشخيصي) يعمل!", 200
 
 @app.route('/health')
 def health():
