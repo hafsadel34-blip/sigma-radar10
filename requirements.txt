@@ -1,0 +1,10 @@
+flask
+aiohttp
+ccxt
+pandas
+numpy
+pandas_ta
+python-telegram-bot
+nest-asyncio
+apscheduler
+gunicorn
