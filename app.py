@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-📡⚛️ SigmaRadar v1.1 – رادار كمّي (نسخة السيرفر مع تتبع وذاكرة ذكية)
+📡⚛️ SigmaRadar v1.2 – بدون pandas_ta/numba (يعمل على Python 3.14)
 """
+
 import asyncio
 import aiohttp
 import pandas as pd
@@ -12,19 +13,14 @@ import logging
 import json
 import os
 import threading
-import time
-from datetime import datetime, timedelta
-from flask import Flask, request
+from datetime import datetime
+from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 
 try:
     import ccxt.async_support as ccxt
 except ImportError:
     raise ImportError("مكتبة ccxt غير مثبتة. استخدم: pip install ccxt")
-try:
-    import pandas_ta as ta
-except ImportError:
-    raise ImportError("مكتبة pandas_ta غير مثبتة. استخدم: pip install pandas_ta")
 try:
     from telegram import Bot
 except ImportError:
@@ -37,19 +33,65 @@ logger = logging.getLogger(__name__)
 # ═══════════════ الإعدادات ═══════════════
 TELEGRAM_TOKEN = "8892386642:AAFrH8mz-XQjYDnsjY2RkPoJz7oMcbIDTdw"
 CHAT_ID = "6499356593"
-CAPITAL = 1000
-RISK_PER_TRADE = 0.02
 MIN_VOLUME = 100_000
 MIN_SCORE = 40
 MIN_RR = 1.8
 TOP_N = 8
 BLACKLIST_FILE = "sigma_blacklist.json"
-ACTIVE_FILE = "sigma_active.json"   # ملف التتبع
+ACTIVE_FILE = "sigma_active.json"
 
 app = Flask(__name__)
 is_scanning = False
 
-# ═══════════════ إدارة الذاكرة الذكية ═══════════════
+# ═══════════════ حساب المؤشرات يدوياً (بدون pandas_ta) ═══════════════
+def calc_rsi(close, period=14):
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calc_adx(high, low, close, period=14):
+    # True Range
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    # Directional Movement
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+    plus_di = 100 * (pd.Series(plus_dm).rolling(window=period).mean() / atr)
+    minus_di = 100 * (pd.Series(minus_dm).rolling(window=period).mean() / atr)
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+    adx = dx.rolling(window=period).mean()
+    return adx
+
+def calc_atr(high, low, close, period=14):
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return atr
+
+def calc_stoch_rsi(close, period=14):
+    rsi = calc_rsi(close, period)
+    min_rsi = rsi.rolling(window=period).min()
+    max_rsi = rsi.rolling(window=period).max()
+    stoch = 100 * (rsi - min_rsi) / (max_rsi - min_rsi)
+    return stoch
+
+def calc_cmf(df, period=20):
+    mfm = ((df['close'] - df['low']) - (df['high'] - df['close'])) / (df['high'] - df['low'])
+    mfv = mfm * df['vol']
+    cmf = mfv.rolling(window=period).sum() / df['vol'].rolling(window=period).sum()
+    return cmf
+
+# ═══════════════ إدارة الذاكرة ═══════════════
 class SmartMemory:
     def __init__(self, blacklist_file=BLACKLIST_FILE, active_file=ACTIVE_FILE):
         self.blacklist_file = blacklist_file
@@ -72,7 +114,6 @@ class SmartMemory:
             logger.error(f"فشل حفظ {filename}: {e}")
 
     def is_blocked(self, symbol: str, cmf_1h: float) -> bool:
-        """تُرفع الحظر إذا كان CMF > 0.2"""
         if symbol not in self.blacklist:
             return False
         if cmf_1h > 0.2:
@@ -88,7 +129,6 @@ class SmartMemory:
         logger.info(f"⛔ {symbol}: أضيفت للقائمة السوداء")
 
     def is_active(self, symbol: str) -> bool:
-        """تتحقق إذا كانت العملة في التتبع (لم تغلق بعد)"""
         return symbol in self.active and self.active[symbol].get('status') != 'closed'
 
     def save_active(self, symbol: str, data: dict):
@@ -100,43 +140,7 @@ class SmartMemory:
             self.active[symbol]['status'] = status
             self._save(self.active_file, self.active)
 
-# ═══════════════ المؤشرات ═══════════════
-class AdvancedIndicators:
-    @staticmethod
-    def alpha_composite(df: pd.DataFrame) -> float:
-        closes = df['close']
-        returns = closes.pct_change()
-        mom = returns.rolling(20).mean().iloc[-1]
-        sma20 = closes.rolling(20).mean().iloc[-1]
-        mr = (closes.iloc[-1] - sma20) / sma20
-        return (mom * 100) - (mr * 50)
-
-    @staticmethod
-    def vwap_deviation(df: pd.DataFrame) -> float:
-        df['typical'] = (df['high'] + df['low'] + df['close']) / 3
-        df['vp'] = df['typical'] * df['vol']
-        vwap = df['vp'].rolling(20).sum() / df['vol'].rolling(20).sum()
-        return (df['close'].iloc[-1] - vwap.iloc[-1]) / vwap.iloc[-1]
-
-    @staticmethod
-    def calc_drawdown(df_daily: pd.DataFrame, price: float) -> dict:
-        if df_daily.empty: return {'ath':0, 'drawdown':0, 'zone':'غير معروف'}
-        ath = df_daily['high'].max()
-        dd = ((ath - price) / ath) * 100
-        if dd >= 70: zone = '🟢🟢 تجميع مؤسسي عميق'
-        elif dd >= 50: zone = '🟢 منطقة تجميع قوية'
-        elif dd >= 30: zone = '🟡 تراجع معتدل'
-        elif dd >= 15: zone = '⚪ تصحيح طبيعي'
-        else: zone = '🔴 قريب من القمة'
-        return {'ath':ath, 'drawdown':round(dd,1), 'zone':zone}
-
-class RiskManager:
-    @staticmethod
-    def dynamic_sl_atr(df: pd.DataFrame, multiplier=1.5) -> float:
-        atr = ta.atr(df['high'], df['low'], df['close'], length=14).iloc[-1]
-        return atr * multiplier
-
-# ═══════════════ الرادار الرئيسي ═══════════════
+# ═══════════════ الرادار ═══════════════
 class SigmaRadar:
     def __init__(self):
         self.exchange = None
@@ -153,7 +157,7 @@ class SigmaRadar:
         if self.exchange: await self.exchange.close()
         if self.session: await self.session.close()
 
-    async def fetch_btc(self) -> tuple:
+    async def fetch_btc(self):
         try:
             ticker = await self.exchange.fetch_ticker('BTC/USDT')
             change = ticker.get('percentage', 0.0)
@@ -164,7 +168,7 @@ class SigmaRadar:
         except:
             return "NEUTRAL", 0.0
 
-    async def get_symbols(self, limit=300) -> list:
+    async def get_symbols(self, limit=300):
         try:
             tickers = await self.exchange.fetch_tickers()
             symbols = []
@@ -178,7 +182,7 @@ class SigmaRadar:
         except:
             return []
 
-    async def analyze(self, symbol: str, regime: str) -> dict | None:
+    async def analyze(self, symbol: str, regime: str):
         try:
             ohlcv_1h, ohlcv_1d = await asyncio.gather(
                 self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200),
@@ -188,23 +192,19 @@ class SigmaRadar:
             df = pd.DataFrame(ohlcv_1h, columns=['time','open','high','low','close','vol'])
             df_daily = pd.DataFrame(ohlcv_1d, columns=['time','open','high','low','close','vol']) if ohlcv_1d else pd.DataFrame()
 
-            df['RSI'] = ta.rsi(df['close'], length=14)
-            stoch = ta.stochrsi(df['close'], length=14)
-            df['StochK'] = stoch.iloc[:,0]
-            df['ADX'] = ta.adx(df['high'], df['low'], df['close'], length=14).iloc[:,0]
-            df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-            df['MFM'] = ((df['close'] - df['low']) - (df['high'] - df['close'])) / (df['high'] - df['low'])
-            df['MFV'] = df['MFM'] * df['vol']
-            df['CMF_1h'] = df['MFV'].rolling(20).sum() / df['vol'].rolling(20).sum()
+            # حساب المؤشرات يدوياً
+            df['RSI'] = calc_rsi(df['close'])
+            df['StochK'] = calc_stoch_rsi(df['close'])
+            df['ADX'] = calc_adx(df['high'], df['low'], df['close'])
+            df['ATR'] = calc_atr(df['high'], df['low'], df['close'])
+            df['CMF_1h'] = calc_cmf(df)
 
             price = df['close'].iloc[-1]
             cmf_1h = df['CMF_1h'].iloc[-1]
             name = symbol.split('/')[0]
 
-            # ⛔ فلتر الذاكرة الذكية
             if self.memory.is_blocked(name, cmf_1h):
                 return None
-            # 🚫 منع التكرار (عملية نشطة)
             if self.memory.is_active(name):
                 return None
 
@@ -212,15 +212,36 @@ class SigmaRadar:
             change_24h = ticker.get('percentage', 0.0)
             volume_24h = ticker.get('quoteVolume', 0)
 
-            alpha = AdvancedIndicators.alpha_composite(df)
-            vwap_dev = AdvancedIndicators.vwap_deviation(df)
-            drawdown = AdvancedIndicators.calc_drawdown(df_daily, price)
-
             rsi = df['RSI'].iloc[-1]
             stoch_k = df['StochK'].iloc[-1]
             adx = df['ADX'].iloc[-1]
             atr = df['ATR'].iloc[-1]
             atr_pct = (atr / price) * 100 if price > 0 else 2.0
+
+            # Drawdown
+            ath = df_daily['high'].max() if not df_daily.empty else price
+            dd = ((ath - price) / ath) * 100 if ath > 0 else 0
+            if dd >= 70: zone = '🟢🟢 تجميع مؤسسي عميق'
+            elif dd >= 50: zone = '🟢 منطقة تجميع قوية'
+            elif dd >= 30: zone = '🟡 تراجع معتدل'
+            elif dd >= 15: zone = '⚪ تصحيح طبيعي'
+            else: zone = '🔴 قريب من القمة'
+
+            # Alpha Composite (تقريبي)
+            returns = df['close'].pct_change()
+            mom = returns.rolling(20).mean().iloc[-1] if len(returns) >= 20 else 0
+            sma20 = df['close'].rolling(20).mean().iloc[-1] if len(df) >= 20 else price
+            mr = (price - sma20) / sma20 if sma20 > 0 else 0
+            alpha = (mom * 100) - (mr * 50)
+
+            # VWAP Deviation
+            if len(df) >= 20:
+                typical = (df['high'] + df['low'] + df['close']) / 3
+                vp = typical * df['vol']
+                vwap = vp.rolling(20).sum() / df['vol'].rolling(20).sum()
+                vwap_dev = (price - vwap.iloc[-1]) / vwap.iloc[-1] if vwap.iloc[-1] != 0 else 0
+            else:
+                vwap_dev = 0
 
             score = 0
             signals = []
@@ -242,9 +263,7 @@ class SigmaRadar:
 
             if score < MIN_SCORE: return None
 
-            sl_amount = RiskManager.dynamic_sl_atr(df, 1.5)
-            sl_pct = (sl_amount / price) * 100
-            sl_pct = max(2.0, min(15.0, sl_pct))
+            sl_pct = max(2.0, min(15.0, atr_pct * 1.5))
             tp1_pct = max(3.0, min(25.0, atr_pct * 2.0))
             tp2_pct = tp1_pct * 1.8
 
@@ -252,38 +271,26 @@ class SigmaRadar:
             tp2 = price * (1 + tp2_pct/100)
             sl = price * (1 - sl_pct/100)
 
-            reward = (tp2 - price) / price
-            risk = sl_pct / 100
-            rr = reward / risk if risk > 0 else 0
+            rr = (tp2_pct / sl_pct) if sl_pct > 0 else 0
             if rr < MIN_RR: return None
 
             # حفظ في التتبع
             self.memory.save_active(name, {
-                'entry': price,
-                'tp1': tp1,
-                'tp2': tp2,
-                'sl': sl,
-                'tp1_pct': round(tp1_pct,1),
-                'tp2_pct': round(tp2_pct,1),
-                'sl_pct': round(sl_pct,1),
-                'entry_time': datetime.now().isoformat(),
-                'status': 'active',
-                'cmf_1h': cmf_1h,
-                'change_24h': change_24h,
-                'volume_24h': volume_24h,
-                'drawdown': drawdown,
-                'rsi': rsi,
-                'adx': adx,
-                'stoch_k': stoch_k,
-                'signals': signals[:4],
-                'score': score
+                'entry': price, 'tp1': tp1, 'tp2': tp2, 'sl': sl,
+                'tp1_pct': round(tp1_pct,1), 'tp2_pct': round(tp2_pct,1), 'sl_pct': round(sl_pct,1),
+                'entry_time': datetime.now().isoformat(), 'status': 'active',
+                'cmf_1h': cmf_1h, 'change_24h': change_24h, 'volume_24h': volume_24h,
+                'drawdown': round(dd,1), 'zone': zone,
+                'rsi': round(rsi,1), 'adx': round(adx,1), 'stoch_k': round(stoch_k,1),
+                'signals': signals[:4], 'score': score
             })
 
             return {
                 'symbol': name, 'score': score, 'price': price,
                 'change_24h': change_24h, 'volume_24h': volume_24h,
-                'drawdown': drawdown, 'rsi': rsi, 'stoch_k': stoch_k, 'adx': adx,
-                'alpha': alpha, 'vwap_dev': vwap_dev, 'cmf_1h': cmf_1h,
+                'drawdown': {'ath': ath, 'drawdown': round(dd,1), 'zone': zone},
+                'rsi': round(rsi,1), 'stoch_k': round(stoch_k,1), 'adx': round(adx,1),
+                'alpha': round(alpha,2), 'vwap_dev': round(vwap_dev,4), 'cmf_1h': round(cmf_1h,3),
                 'tp1': tp1, 'tp2': tp2, 'sl': sl,
                 'tp1_pct': round(tp1_pct,1), 'tp2_pct': round(tp2_pct,1),
                 'sl_pct': round(sl_pct,1), 'rr': round(rr,1),
@@ -294,25 +301,22 @@ class SigmaRadar:
             return None
 
     async def track_active_signals(self):
-        """تحديث حالة الصفقات المفتوحة وإرسال تنبيهات TP/SL"""
-        memory = self.memory
-        for symbol, data in list(memory.active.items()):
+        for symbol, data in list(self.memory.active.items()):
             if data.get('status') == 'closed':
                 continue
             try:
                 ticker = await self.exchange.fetch_ticker(f"{symbol}/USDT")
                 price = ticker['last']
-                # التحقق من الأهداف
                 if price >= data['tp2']:
                     await self.send_telegram(f"🚀 {symbol} حقق الهدف الثاني (TP2) عند {price:.6f} 🎉")
-                    memory.close_active(symbol, 'closed')
+                    self.memory.close_active(symbol, 'closed')
                 elif price >= data['tp1']:
                     await self.send_telegram(f"✅ {symbol} حقق الهدف الأول (TP1) عند {price:.6f}")
-                    memory.close_active(symbol, 'tp1_hit')
+                    self.memory.close_active(symbol, 'tp1_hit')
                 elif price <= data['sl']:
                     await self.send_telegram(f"❌ {symbol} ضرب وقف الخسارة (SL) عند {price:.6f}")
-                    memory.add_failure(symbol, data['entry'], data['sl'])
-                    memory.close_active(symbol, 'closed')
+                    self.memory.add_failure(symbol, data['entry'], data['sl'])
+                    self.memory.close_active(symbol, 'closed')
             except Exception as e:
                 logger.error(f"خطأ في تتبع {symbol}: {e}")
 
@@ -329,13 +333,11 @@ class SigmaRadar:
 
     async def hunt(self):
         print("\n" + "="*60)
-        print("  📡⚛️ SigmaRadar v1.1 (Tracking)")
+        print("  📡⚛️ SigmaRadar v1.2 (بدون pandas_ta)")
         print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # أولاً: تتبع الصفقات المفتوحة
         await self.track_active_signals()
 
-        # ثانياً: فحص السوق بحثاً عن فرص جديدة
         regime, btc_change = await self.fetch_btc()
         print(f"  Market: {regime} | BTC: {btc_change:+.2f}%")
         symbols = await self.get_symbols(300)
@@ -399,7 +401,7 @@ def run_hunt_background():
 
 @app.route('/')
 def home():
-    return "📡⚛️ SigmaRadar v1.1 يعمل!", 200
+    return "📡⚛️ SigmaRadar v1.2 يعمل (بدون pandas_ta)!", 200
 
 @app.route('/health')
 def health():
@@ -415,6 +417,5 @@ def cron():
     run_hunt_background()
     return "OK", 200
 
-# ═══════════════ تشغيل التطبيق ═══════════════
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
