@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-📡⚛️ SigmaRadar v1.4 – إصلاح مهلة ccxt
+📡⚛️ SigmaRadar v1.5 – إصلاح كامل لمشكلة Timeout
 """
 
 import asyncio
@@ -147,7 +147,10 @@ class SigmaRadar:
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
-        self.exchange = ccxt.kucoin({'enableRateLimit': True})
+        self.exchange = ccxt.kucoin({
+            'enableRateLimit': True,
+            'timeout': 15000,  # مهلة 15 ثانية
+        })
         return self
 
     async def __aexit__(self, *args):
@@ -227,7 +230,10 @@ class SigmaRadar:
                 print("🔄 نشط")
                 return None
 
-            ticker = await asyncio.wait_for(self.exchange.fetch_ticker(symbol), timeout=5.0)
+            ticker = await asyncio.wait_for(
+                self.exchange.fetch_ticker(symbol),
+                timeout=5.0
+            )
             change_24h = ticker.get('percentage', 0.0)
             volume_24h = ticker.get('quoteVolume', 0)
 
@@ -362,7 +368,7 @@ class SigmaRadar:
 
     async def hunt(self):
         print("\n" + "="*60)
-        print("  📡⚛️ SigmaRadar v1.4 (إصلاح المهلة)")
+        print("  📡⚛️ SigmaRadar v1.5 (إصلاح نهائي)")
         print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*60)
 
@@ -437,7 +443,7 @@ def run_hunt_background():
 
 @app.route('/')
 def home():
-    return "📡⚛️ SigmaRadar v1.4 (إصلاح المهلة) يعمل!", 200
+    return "📡⚛️ SigmaRadar v1.5 (إصلاح نهائي) يعمل!", 200
 
 @app.route('/health')
 def health():
