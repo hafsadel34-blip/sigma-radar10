@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-📡⚛️ SigmaRadar v1.3 – مع سجلات تشخيصية مفصلة
+📡⚛️ SigmaRadar v1.4 – إصلاح مهلة ccxt
 """
 
 import asyncio
@@ -15,7 +15,6 @@ import os
 import threading
 from datetime import datetime
 from flask import Flask
-from apscheduler.schedulers.background import BackgroundScheduler
 
 try:
     import ccxt.async_support as ccxt
@@ -158,13 +157,19 @@ class SigmaRadar:
     async def fetch_btc(self):
         try:
             print("  📡 جلب بيانات BTC...")
-            ticker = await self.exchange.fetch_ticker('BTC/USDT')
+            ticker = await asyncio.wait_for(
+                self.exchange.fetch_ticker('BTC/USDT'),
+                timeout=10.0
+            )
             change = ticker.get('percentage', 0.0)
             if change > 1.0: regime = "BULL"
             elif change < -1.0: regime = "BEAR"
             else: regime = "NEUTRAL"
             print(f"  ✅ BTC: {change:+.2f}% | {regime}")
             return regime, change
+        except asyncio.TimeoutError:
+            print("  ❌ مهلة جلب BTC (10 ثوانٍ)")
+            return "NEUTRAL", 0.0
         except Exception as e:
             print(f"  ❌ فشل جلب BTC: {e}")
             return "NEUTRAL", 0.0
@@ -172,7 +177,10 @@ class SigmaRadar:
     async def get_symbols(self, limit=300):
         try:
             print("  📡 جلب قائمة العملات من KuCoin...")
-            tickers = await self.exchange.fetch_tickers()
+            tickers = await asyncio.wait_for(
+                self.exchange.fetch_tickers(),
+                timeout=15.0
+            )
             symbols = []
             for sym, t in tickers.items():
                 if not sym.endswith('/USDT'): continue
@@ -182,6 +190,9 @@ class SigmaRadar:
             symbols.sort(key=lambda s: tickers[s]['quoteVolume'], reverse=True)
             print(f"  ✅ تم جلب {len(symbols)} عملة (أخذ أول {limit})")
             return symbols[:limit]
+        except asyncio.TimeoutError:
+            print("  ❌ مهلة جلب العملات (15 ثانية)")
+            return []
         except Exception as e:
             print(f"  ❌ فشل جلب العملات: {e}")
             return []
@@ -190,8 +201,8 @@ class SigmaRadar:
         try:
             print(f"    🔍 تحليل {symbol}...", end=' ')
             ohlcv_1h, ohlcv_1d = await asyncio.gather(
-                self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200),
-                self.exchange.fetch_ohlcv(symbol, timeframe='1d', limit=90)
+                asyncio.wait_for(self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200), timeout=10.0),
+                asyncio.wait_for(self.exchange.fetch_ohlcv(symbol, timeframe='1d', limit=90), timeout=10.0)
             )
             if not ohlcv_1h or len(ohlcv_1h) < 50:
                 print("❌ بيانات غير كافية")
@@ -199,7 +210,6 @@ class SigmaRadar:
             df = pd.DataFrame(ohlcv_1h, columns=['time','open','high','low','close','vol'])
             df_daily = pd.DataFrame(ohlcv_1d, columns=['time','open','high','low','close','vol']) if ohlcv_1d else pd.DataFrame()
 
-            # حساب المؤشرات
             df['RSI'] = calc_rsi(df['close'])
             df['StochK'] = calc_stoch_rsi(df['close'])
             df['ADX'] = calc_adx(df['high'], df['low'], df['close'])
@@ -217,7 +227,7 @@ class SigmaRadar:
                 print("🔄 نشط")
                 return None
 
-            ticker = await self.exchange.fetch_ticker(symbol)
+            ticker = await asyncio.wait_for(self.exchange.fetch_ticker(symbol), timeout=5.0)
             change_24h = ticker.get('percentage', 0.0)
             volume_24h = ticker.get('quoteVolume', 0)
 
@@ -227,7 +237,6 @@ class SigmaRadar:
             atr = df['ATR'].iloc[-1] if not pd.isna(df['ATR'].iloc[-1]) else price * 0.02
             atr_pct = (atr / price) * 100 if price > 0 else 2.0
 
-            # Drawdown
             ath = df_daily['high'].max() if not df_daily.empty else price
             dd = ((ath - price) / ath) * 100 if ath > 0 else 0
             if dd >= 70: zone = '🟢🟢 تجميع مؤسسي عميق'
@@ -285,7 +294,6 @@ class SigmaRadar:
                 print(f"❌ R/R منخفض ({rr:.1f})")
                 return None
 
-            # حفظ في التتبع
             self.memory.save_active(name, {
                 'entry': price, 'tp1': tp1, 'tp2': tp2, 'sl': sl,
                 'tp1_pct': round(tp1_pct,1), 'tp2_pct': round(tp2_pct,1), 'sl_pct': round(sl_pct,1),
@@ -308,6 +316,9 @@ class SigmaRadar:
                 'sl_pct': round(sl_pct,1), 'rr': round(rr,1),
                 'signals': signals[:4]
             }
+        except asyncio.TimeoutError:
+            print(f"⏰ مهلة في تحليل {symbol}")
+            return None
         except Exception as e:
             print(f"⚠️ خطأ: {e}")
             return None
@@ -318,7 +329,10 @@ class SigmaRadar:
             if data.get('status') == 'closed':
                 continue
             try:
-                ticker = await self.exchange.fetch_ticker(f"{symbol}/USDT")
+                ticker = await asyncio.wait_for(
+                    self.exchange.fetch_ticker(f"{symbol}/USDT"),
+                    timeout=5.0
+                )
                 price = ticker['last']
                 if price >= data['tp2']:
                     await self.send_telegram(f"🚀 {symbol} حقق الهدف الثاني (TP2) عند {price:.6f} 🎉")
@@ -330,6 +344,8 @@ class SigmaRadar:
                     await self.send_telegram(f"❌ {symbol} ضرب وقف الخسارة (SL) عند {price:.6f}")
                     self.memory.add_failure(symbol, data['entry'], data['sl'])
                     self.memory.close_active(symbol, 'closed')
+            except asyncio.TimeoutError:
+                logger.warning(f"⏰ مهلة تتبع {symbol}")
             except Exception as e:
                 logger.error(f"خطأ في تتبع {symbol}: {e}")
 
@@ -346,11 +362,10 @@ class SigmaRadar:
 
     async def hunt(self):
         print("\n" + "="*60)
-        print("  📡⚛️ SigmaRadar v1.3 (تشخيصي)")
+        print("  📡⚛️ SigmaRadar v1.4 (إصلاح المهلة)")
         print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*60)
 
-        print("  🔍 تتبع الصفقات المفتوحة...")
         await self.track_active_signals()
 
         regime, btc_change = await self.fetch_btc()
@@ -422,7 +437,7 @@ def run_hunt_background():
 
 @app.route('/')
 def home():
-    return "📡⚛️ SigmaRadar v1.3 (تشخيصي) يعمل!", 200
+    return "📡⚛️ SigmaRadar v1.4 (إصلاح المهلة) يعمل!", 200
 
 @app.route('/health')
 def health():
