@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-📡⚛️ SigmaRadar v1.5 – إصلاح كامل لمشكلة Timeout
+📡⚛️ SigmaRadar v1.6 – إزالة asyncio.wait_for
 """
 
 import asyncio
@@ -42,7 +42,7 @@ ACTIVE_FILE = "sigma_active.json"
 app = Flask(__name__)
 is_scanning = False
 
-# ═══════════════ حساب المؤشرات يدوياً ═══════════════
+# ═══════════════ حساب المؤشرات ═══════════════
 def calc_rsi(close, period=14):
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -149,7 +149,7 @@ class SigmaRadar:
         self.session = aiohttp.ClientSession()
         self.exchange = ccxt.kucoin({
             'enableRateLimit': True,
-            'timeout': 15000,  # مهلة 15 ثانية
+            'timeout': 30000,  # مهلة 30 ثانية
         })
         return self
 
@@ -160,18 +160,15 @@ class SigmaRadar:
     async def fetch_btc(self):
         try:
             print("  📡 جلب بيانات BTC...")
-            ticker = await asyncio.wait_for(
-                self.exchange.fetch_ticker('BTC/USDT'),
-                timeout=10.0
-            )
+            ticker = await self.exchange.fetch_ticker('BTC/USDT')
             change = ticker.get('percentage', 0.0)
             if change > 1.0: regime = "BULL"
             elif change < -1.0: regime = "BEAR"
             else: regime = "NEUTRAL"
             print(f"  ✅ BTC: {change:+.2f}% | {regime}")
             return regime, change
-        except asyncio.TimeoutError:
-            print("  ❌ مهلة جلب BTC (10 ثوانٍ)")
+        except ccxt.RequestTimeout:
+            print("  ❌ مهلة جلب BTC (ccxt)")
             return "NEUTRAL", 0.0
         except Exception as e:
             print(f"  ❌ فشل جلب BTC: {e}")
@@ -180,10 +177,7 @@ class SigmaRadar:
     async def get_symbols(self, limit=300):
         try:
             print("  📡 جلب قائمة العملات من KuCoin...")
-            tickers = await asyncio.wait_for(
-                self.exchange.fetch_tickers(),
-                timeout=15.0
-            )
+            tickers = await self.exchange.fetch_tickers()
             symbols = []
             for sym, t in tickers.items():
                 if not sym.endswith('/USDT'): continue
@@ -193,8 +187,8 @@ class SigmaRadar:
             symbols.sort(key=lambda s: tickers[s]['quoteVolume'], reverse=True)
             print(f"  ✅ تم جلب {len(symbols)} عملة (أخذ أول {limit})")
             return symbols[:limit]
-        except asyncio.TimeoutError:
-            print("  ❌ مهلة جلب العملات (15 ثانية)")
+        except ccxt.RequestTimeout:
+            print("  ❌ مهلة جلب العملات (ccxt)")
             return []
         except Exception as e:
             print(f"  ❌ فشل جلب العملات: {e}")
@@ -203,10 +197,8 @@ class SigmaRadar:
     async def analyze(self, symbol: str, regime: str):
         try:
             print(f"    🔍 تحليل {symbol}...", end=' ')
-            ohlcv_1h, ohlcv_1d = await asyncio.gather(
-                asyncio.wait_for(self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200), timeout=10.0),
-                asyncio.wait_for(self.exchange.fetch_ohlcv(symbol, timeframe='1d', limit=90), timeout=10.0)
-            )
+            ohlcv_1h = await self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200)
+            ohlcv_1d = await self.exchange.fetch_ohlcv(symbol, timeframe='1d', limit=90)
             if not ohlcv_1h or len(ohlcv_1h) < 50:
                 print("❌ بيانات غير كافية")
                 return None
@@ -230,10 +222,7 @@ class SigmaRadar:
                 print("🔄 نشط")
                 return None
 
-            ticker = await asyncio.wait_for(
-                self.exchange.fetch_ticker(symbol),
-                timeout=5.0
-            )
+            ticker = await self.exchange.fetch_ticker(symbol)
             change_24h = ticker.get('percentage', 0.0)
             volume_24h = ticker.get('quoteVolume', 0)
 
@@ -322,7 +311,7 @@ class SigmaRadar:
                 'sl_pct': round(sl_pct,1), 'rr': round(rr,1),
                 'signals': signals[:4]
             }
-        except asyncio.TimeoutError:
+        except ccxt.RequestTimeout:
             print(f"⏰ مهلة في تحليل {symbol}")
             return None
         except Exception as e:
@@ -335,10 +324,7 @@ class SigmaRadar:
             if data.get('status') == 'closed':
                 continue
             try:
-                ticker = await asyncio.wait_for(
-                    self.exchange.fetch_ticker(f"{symbol}/USDT"),
-                    timeout=5.0
-                )
+                ticker = await self.exchange.fetch_ticker(f"{symbol}/USDT")
                 price = ticker['last']
                 if price >= data['tp2']:
                     await self.send_telegram(f"🚀 {symbol} حقق الهدف الثاني (TP2) عند {price:.6f} 🎉")
@@ -350,7 +336,7 @@ class SigmaRadar:
                     await self.send_telegram(f"❌ {symbol} ضرب وقف الخسارة (SL) عند {price:.6f}")
                     self.memory.add_failure(symbol, data['entry'], data['sl'])
                     self.memory.close_active(symbol, 'closed')
-            except asyncio.TimeoutError:
+            except ccxt.RequestTimeout:
                 logger.warning(f"⏰ مهلة تتبع {symbol}")
             except Exception as e:
                 logger.error(f"خطأ في تتبع {symbol}: {e}")
@@ -368,7 +354,7 @@ class SigmaRadar:
 
     async def hunt(self):
         print("\n" + "="*60)
-        print("  📡⚛️ SigmaRadar v1.5 (إصلاح نهائي)")
+        print("  📡⚛️ SigmaRadar v1.6 (بدون wait_for)")
         print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*60)
 
@@ -443,7 +429,7 @@ def run_hunt_background():
 
 @app.route('/')
 def home():
-    return "📡⚛️ SigmaRadar v1.5 (إصلاح نهائي) يعمل!", 200
+    return "📡⚛️ SigmaRadar v1.6 (بدون wait_for) يعمل!", 200
 
 @app.route('/health')
 def health():
