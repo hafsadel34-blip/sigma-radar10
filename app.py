@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-📡⚛️ SigmaRadar v2.0 – متزامن (بدون asyncio/ccxt)
+📡⚛️ SigmaRadar v2.1 – تتبع ذكي باستخدام High/Low (حتى أثناء النوم)
 """
 
 import ccxt
@@ -124,7 +124,7 @@ class SmartMemory:
             self.active[symbol]['status'] = status
             self._save(self.active_file, self.active)
 
-# ═══════════════ دالة إرسال تليجرام (متزامنة) ═══════════════
+# ═══════════════ دالة إرسال تليجرام ═══════════════
 def send_telegram(message: str):
     try:
         for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
@@ -295,43 +295,74 @@ class SigmaRadar:
             print(f"⚠️ خطأ في {symbol}: {e}")
             return None
 
+    # ═══════════════════════════════════════════════════
+    # 🧠 التتبع الذكي – يتحقق من أعلى/أدنى سعر خلال 6 ساعات
+    # ═══════════════════════════════════════════════════
     def track_active_signals(self):
-        print("  🔍 تتبع الصفقات المفتوحة...")
+        print("  🔍 تتبع الصفقات المفتوحة (باستخدام High/Low)...")
         for symbol, data in list(self.memory.active.items()):
             if data.get('status') == 'closed':
                 continue
             try:
-                ticker = self.exchange.fetch_ticker(f"{symbol}/USDT")
-                price = ticker['last']
-                if price >= data['tp2']:
-                    send_telegram(f"🚀 {symbol} حقق الهدف الثاني (TP2) عند {price:.6f} 🎉")
+                # جلب آخر 6 شموع ساعة (لتغطية فترة السكون حتى 6 ساعات)
+                ohlcv = self.exchange.fetch_ohlcv(f"{symbol}/USDT", timeframe='1h', limit=6)
+                if not ohlcv:
+                    continue
+                # استخراج أعلى وأدنى سعر خلال الـ 6 ساعات الماضية
+                highs = [c[2] for c in ohlcv]  # السعر الأعلى
+                lows = [c[3] for c in ohlcv]   # السعر الأدنى
+                max_price = max(highs)
+                min_price = min(lows)
+                current_price = ohlcv[-1][4]  # آخر سعر إغلاق
+
+                tp1 = data['tp1']
+                tp2 = data['tp2']
+                sl = data['sl']
+                entry = data['entry']
+
+                # التحقق من TP2 أولاً (أعلى هدف)
+                if max_price >= tp2:
+                    send_telegram(f"🚀 {symbol} حقق الهدف الثاني (TP2) عند أعلى سعر {max_price:.6f} 🎉")
                     self.memory.close_active(symbol, 'closed')
-                elif price >= data['tp1']:
-                    send_telegram(f"✅ {symbol} حقق الهدف الأول (TP1) عند {price:.6f}")
-                    self.memory.close_active(symbol, 'tp1_hit')
-                elif price <= data['sl']:
-                    send_telegram(f"❌ {symbol} ضرب وقف الخسارة (SL) عند {price:.6f}")
-                    self.memory.add_failure(symbol, data['entry'], data['sl'])
+                # ثم TP1 إذا لم يتحقق TP2
+                elif max_price >= tp1 and data.get('status') != 'tp1_hit':
+                    send_telegram(f"✅ {symbol} حقق الهدف الأول (TP1) عند أعلى سعر {max_price:.6f}")
+                    self.memory.close_active(symbol, 'tp1_hit')  # نغلقها لأنها حققت TP1
+                # ثم SL (وقف الخسارة)
+                elif min_price <= sl:
+                    send_telegram(f"❌ {symbol} ضرب وقف الخسارة (SL) عند أدنى سعر {min_price:.6f}")
+                    self.memory.add_failure(symbol, entry, sl)
                     self.memory.close_active(symbol, 'closed')
+                else:
+                    # إذا كان السعر الحالي لا يزال ضمن النطاق ولا شيء تغير
+                    pass
+
             except Exception as e:
                 print(f"⚠️ خطأ في تتبع {symbol}: {e}")
 
+    # ═══════════════════════════════════════════════════
+    # 🚀 التشغيل الرئيسي
+    # ═══════════════════════════════════════════════════
     def hunt(self):
         print("\n" + "="*60)
-        print("  📡⚛️ SigmaRadar v2.0 (متزامن)")
+        print("  📡⚛️ SigmaRadar v2.1 (تتبع ذكي High/Low)")
         print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*60)
 
+        # 1️⃣ تتبع الصفقات المفتوحة (باستخدام High/Low)
         self.track_active_signals()
 
+        # 2️⃣ جلب حالة السوق
         regime, btc_change = self.fetch_btc()
         print(f"  Market: {regime} | BTC: {btc_change:+.2f}%")
 
+        # 3️⃣ جلب قائمة العملات
         symbols = self.get_symbols(300)
         if not symbols:
             print("  ❌ لا توجد عملات! تحقق من الاتصال بـ KuCoin.")
             return
 
+        # 4️⃣ تحليل العملات بالتوازي
         print(f"  🔍 تحليل {len(symbols)} عملة...")
         results = []
         with ThreadPoolExecutor(max_workers=10) as executor:
@@ -341,6 +372,7 @@ class SigmaRadar:
                 if result:
                     results.append(result)
 
+        # 5️⃣ ترتيب النتائج واختيار الأفضل
         results.sort(key=lambda x: -x['score'])
         top = results[:TOP_N]
         if not top:
@@ -348,6 +380,8 @@ class SigmaRadar:
             return
 
         print(f"  ✅ تم العثور على {len(top)} فرصة!")
+
+        # 6️⃣ بناء رسالة التوصيات
         msg = f"📡⚛️ *توصيات SigmaRadar الكمّية* — {datetime.now().strftime('%H:%M')}\n"
         msg += f"{'─'*30}\n"
         msg += f"السوق: {regime} | BTC: {btc_change:+.2f}%\n"
@@ -368,8 +402,10 @@ class SigmaRadar:
             msg += f"💡 {s['signals'][0] if s['signals'] else ''}\n"
             msg += f"{'─'*30}\n\n"
 
+        # 7️⃣ إرسال التوصيات إلى تليجرام
         send_telegram(msg)
         print("  ✅ تم إرسال التوصيات إلى تليجرام.")
+
 
 # ═══════════════ نقاط النهاية Flask ═══════════════
 def run_hunt_background():
@@ -393,7 +429,7 @@ def run_hunt_background():
 
 @app.route('/')
 def home():
-    return "📡⚛️ SigmaRadar v2.0 (متزامن) يعمل!", 200
+    return "📡⚛️ SigmaRadar v2.1 (تتبع ذكي High/Low) يعمل!", 200
 
 @app.route('/health')
 def health():
