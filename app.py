@@ -1,33 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-📡⚛️ SigmaRadar v1.6 – إزالة asyncio.wait_for
+📡⚛️ SigmaRadar v2.0 – متزامن (بدون asyncio/ccxt)
 """
 
-import asyncio
-import aiohttp
+import ccxt
 import pandas as pd
 import numpy as np
-import nest_asyncio
-import logging
 import json
 import os
 import threading
+import time
 from datetime import datetime
 from flask import Flask
-
-try:
-    import ccxt.async_support as ccxt
-except ImportError:
-    raise ImportError("مكتبة ccxt غير مثبتة. استخدم: pip install ccxt")
-try:
-    from telegram import Bot
-except ImportError:
-    Bot = None
-
-nest_asyncio.apply()
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
 
 # ═══════════════ الإعدادات ═══════════════
 TELEGRAM_TOKEN = "8892386642:AAFrH8mz-XQjYDnsjY2RkPoJz7oMcbIDTdw"
@@ -108,13 +95,13 @@ class SmartMemory:
             with open(filename, 'w') as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
-            logger.error(f"فشل حفظ {filename}: {e}")
+            print(f"⚠️ فشل حفظ {filename}: {e}")
 
     def is_blocked(self, symbol: str, cmf_1h: float) -> bool:
         if symbol not in self.blacklist:
             return False
         if cmf_1h > 0.2:
-            logger.info(f"🔓 {symbol}: تم رفع الحظر – CMF={cmf_1h:.3f}")
+            print(f"🔓 {symbol}: تم رفع الحظر – CMF={cmf_1h:.3f}")
             del self.blacklist[symbol]
             self._save(self.blacklist_file, self.blacklist)
             return False
@@ -123,7 +110,7 @@ class SmartMemory:
     def add_failure(self, symbol: str, entry: float, sl: float):
         self.blacklist[symbol] = {'entry': entry, 'sl': sl, 'time': datetime.now().isoformat()}
         self._save(self.blacklist_file, self.blacklist)
-        logger.info(f"⛔ {symbol}: أضيفت للقائمة السوداء")
+        print(f"⛔ {symbol}: أضيفت للقائمة السوداء")
 
     def is_active(self, symbol: str) -> bool:
         return symbol in self.active and self.active[symbol].get('status') != 'closed'
@@ -137,47 +124,43 @@ class SmartMemory:
             self.active[symbol]['status'] = status
             self._save(self.active_file, self.active)
 
-# ═══════════════ الرادار ═══════════════
+# ═══════════════ دالة إرسال تليجرام (متزامنة) ═══════════════
+def send_telegram(message: str):
+    try:
+        for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, json={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "Markdown"})
+            time.sleep(0.5)
+    except Exception as e:
+        print(f"⚠️ Telegram error: {e}")
+
+# ═══════════════ الرادار (متزامن) ═══════════════
 class SigmaRadar:
     def __init__(self):
-        self.exchange = None
-        self.session = None
-        self.semaphore = asyncio.Semaphore(30)
-        self.memory = SmartMemory()
-
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
         self.exchange = ccxt.kucoin({
             'enableRateLimit': True,
-            'timeout': 30000,  # مهلة 30 ثانية
+            'timeout': 30000,
         })
-        return self
+        self.memory = SmartMemory()
 
-    async def __aexit__(self, *args):
-        if self.exchange: await self.exchange.close()
-        if self.session: await self.session.close()
-
-    async def fetch_btc(self):
+    def fetch_btc(self):
         try:
             print("  📡 جلب بيانات BTC...")
-            ticker = await self.exchange.fetch_ticker('BTC/USDT')
+            ticker = self.exchange.fetch_ticker('BTC/USDT')
             change = ticker.get('percentage', 0.0)
             if change > 1.0: regime = "BULL"
             elif change < -1.0: regime = "BEAR"
             else: regime = "NEUTRAL"
             print(f"  ✅ BTC: {change:+.2f}% | {regime}")
             return regime, change
-        except ccxt.RequestTimeout:
-            print("  ❌ مهلة جلب BTC (ccxt)")
-            return "NEUTRAL", 0.0
         except Exception as e:
             print(f"  ❌ فشل جلب BTC: {e}")
             return "NEUTRAL", 0.0
 
-    async def get_symbols(self, limit=300):
+    def get_symbols(self, limit=300):
         try:
             print("  📡 جلب قائمة العملات من KuCoin...")
-            tickers = await self.exchange.fetch_tickers()
+            tickers = self.exchange.fetch_tickers()
             symbols = []
             for sym, t in tickers.items():
                 if not sym.endswith('/USDT'): continue
@@ -187,18 +170,15 @@ class SigmaRadar:
             symbols.sort(key=lambda s: tickers[s]['quoteVolume'], reverse=True)
             print(f"  ✅ تم جلب {len(symbols)} عملة (أخذ أول {limit})")
             return symbols[:limit]
-        except ccxt.RequestTimeout:
-            print("  ❌ مهلة جلب العملات (ccxt)")
-            return []
         except Exception as e:
             print(f"  ❌ فشل جلب العملات: {e}")
             return []
 
-    async def analyze(self, symbol: str, regime: str):
+    def analyze(self, symbol: str, regime: str):
         try:
             print(f"    🔍 تحليل {symbol}...", end=' ')
-            ohlcv_1h = await self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200)
-            ohlcv_1d = await self.exchange.fetch_ohlcv(symbol, timeframe='1d', limit=90)
+            ohlcv_1h = self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200)
+            ohlcv_1d = self.exchange.fetch_ohlcv(symbol, timeframe='1d', limit=90)
             if not ohlcv_1h or len(ohlcv_1h) < 50:
                 print("❌ بيانات غير كافية")
                 return None
@@ -222,7 +202,7 @@ class SigmaRadar:
                 print("🔄 نشط")
                 return None
 
-            ticker = await self.exchange.fetch_ticker(symbol)
+            ticker = self.exchange.fetch_ticker(symbol)
             change_24h = ticker.get('percentage', 0.0)
             volume_24h = ticker.get('quoteVolume', 0)
 
@@ -311,67 +291,56 @@ class SigmaRadar:
                 'sl_pct': round(sl_pct,1), 'rr': round(rr,1),
                 'signals': signals[:4]
             }
-        except ccxt.RequestTimeout:
-            print(f"⏰ مهلة في تحليل {symbol}")
-            return None
         except Exception as e:
-            print(f"⚠️ خطأ: {e}")
+            print(f"⚠️ خطأ في {symbol}: {e}")
             return None
 
-    async def track_active_signals(self):
+    def track_active_signals(self):
         print("  🔍 تتبع الصفقات المفتوحة...")
         for symbol, data in list(self.memory.active.items()):
             if data.get('status') == 'closed':
                 continue
             try:
-                ticker = await self.exchange.fetch_ticker(f"{symbol}/USDT")
+                ticker = self.exchange.fetch_ticker(f"{symbol}/USDT")
                 price = ticker['last']
                 if price >= data['tp2']:
-                    await self.send_telegram(f"🚀 {symbol} حقق الهدف الثاني (TP2) عند {price:.6f} 🎉")
+                    send_telegram(f"🚀 {symbol} حقق الهدف الثاني (TP2) عند {price:.6f} 🎉")
                     self.memory.close_active(symbol, 'closed')
                 elif price >= data['tp1']:
-                    await self.send_telegram(f"✅ {symbol} حقق الهدف الأول (TP1) عند {price:.6f}")
+                    send_telegram(f"✅ {symbol} حقق الهدف الأول (TP1) عند {price:.6f}")
                     self.memory.close_active(symbol, 'tp1_hit')
                 elif price <= data['sl']:
-                    await self.send_telegram(f"❌ {symbol} ضرب وقف الخسارة (SL) عند {price:.6f}")
+                    send_telegram(f"❌ {symbol} ضرب وقف الخسارة (SL) عند {price:.6f}")
                     self.memory.add_failure(symbol, data['entry'], data['sl'])
                     self.memory.close_active(symbol, 'closed')
-            except ccxt.RequestTimeout:
-                logger.warning(f"⏰ مهلة تتبع {symbol}")
             except Exception as e:
-                logger.error(f"خطأ في تتبع {symbol}: {e}")
+                print(f"⚠️ خطأ في تتبع {symbol}: {e}")
 
-    async def send_telegram(self, message: str):
-        if not Bot: return
-        try:
-            bot = Bot(token=TELEGRAM_TOKEN)
-            async with bot:
-                for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
-                    await bot.send_message(chat_id=CHAT_ID, text=chunk, parse_mode='Markdown')
-                    await asyncio.sleep(0.5)
-        except Exception as e:
-            logger.error(f"Telegram error: {e}")
-
-    async def hunt(self):
+    def hunt(self):
         print("\n" + "="*60)
-        print("  📡⚛️ SigmaRadar v1.6 (بدون wait_for)")
+        print("  📡⚛️ SigmaRadar v2.0 (متزامن)")
         print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*60)
 
-        await self.track_active_signals()
+        self.track_active_signals()
 
-        regime, btc_change = await self.fetch_btc()
+        regime, btc_change = self.fetch_btc()
         print(f"  Market: {regime} | BTC: {btc_change:+.2f}%")
 
-        symbols = await self.get_symbols(300)
+        symbols = self.get_symbols(300)
         if not symbols:
             print("  ❌ لا توجد عملات! تحقق من الاتصال بـ KuCoin.")
             return
 
         print(f"  🔍 تحليل {len(symbols)} عملة...")
-        tasks = [self.analyze(sym, regime) for sym in symbols]
-        results = await asyncio.gather(*tasks)
-        results = [r for r in results if r is not None]
+        results = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(self.analyze, sym, regime): sym for sym in symbols}
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    results.append(result)
+
         results.sort(key=lambda x: -x['score'])
         top = results[:TOP_N]
         if not top:
@@ -399,7 +368,7 @@ class SigmaRadar:
             msg += f"💡 {s['signals'][0] if s['signals'] else ''}\n"
             msg += f"{'─'*30}\n\n"
 
-        await self.send_telegram(msg)
+        send_telegram(msg)
         print("  ✅ تم إرسال التوصيات إلى تليجرام.")
 
 # ═══════════════ نقاط النهاية Flask ═══════════════
@@ -412,15 +381,10 @@ def run_hunt_background():
         global is_scanning
         is_scanning = True
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            async def runner():
-                async with SigmaRadar() as radar:
-                    await radar.hunt()
-            loop.run_until_complete(runner())
-            loop.close()
+            radar = SigmaRadar()
+            radar.hunt()
         except Exception as e:
-            logger.error(f"خطأ في الخلفية: {e}")
+            print(f"❌ خطأ في الخلفية: {e}")
         finally:
             is_scanning = False
     thread = threading.Thread(target=_run)
@@ -429,7 +393,7 @@ def run_hunt_background():
 
 @app.route('/')
 def home():
-    return "📡⚛️ SigmaRadar v1.6 (بدون wait_for) يعمل!", 200
+    return "📡⚛️ SigmaRadar v2.0 (متزامن) يعمل!", 200
 
 @app.route('/health')
 def health():
