@@ -2,11 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 📡⚛️ SigmaRadar v2.3 – تتبع ذكي + أرقام فريدة + حماية كاملة
-- إصلاح Race Condition في العداد (Threading Lock)
-- إصلاح CMF: nan
-- فلتر StochRSI متطرف
-- سقف SL = 8%
-- متابعة TP2 بعد TP1
 """
 
 import ccxt
@@ -28,9 +23,9 @@ MIN_VOLUME = 100_000
 MIN_SCORE = 40
 MIN_RR = 1.8
 TOP_N = 8
-MAX_SL_PCT = 8.0          # 🛡️ سقف وقف الخسارة
-MAX_RSI_ENTRY = 72.0      # 🛡️ رفض ذروة الشراء
-MAX_STOCH_ENTRY = 98.0    # 🛡️ رفض StochRSI متطرف
+MAX_SL_PCT = 8.0
+MAX_RSI_ENTRY = 72.0
+MAX_STOCH_ENTRY = 98.0
 
 BLACKLIST_FILE = "sigma_blacklist.json"
 ACTIVE_FILE = "sigma_active.json"
@@ -82,7 +77,6 @@ def calc_stoch_rsi(close, period=14):
     return stoch
 
 def calc_cmf(df, period=20):
-    """🛡️ مُحصّن ضد القسمة على صفر (high == low)."""
     range_hl = (df['high'] - df['low']).replace(0, np.nan)
     mfm = ((df['close'] - df['low']) - (df['high'] - df['close'])) / range_hl
     mfm = mfm.fillna(0)
@@ -97,7 +91,6 @@ class SmartMemory:
         self.active_file = active_file
         self.counter_file = COUNTER_FILE
         self.history_file = HISTORY_FILE
-        # 🔒 أقفال للوصول الآمن من خيوط متعددة
         self._lock = threading.Lock()
         self._active_lock = threading.Lock()
         self._history_lock = threading.Lock()
@@ -120,14 +113,12 @@ class SmartMemory:
         except Exception as e:
             print(f"⚠️ فشل حفظ {filename}: {e}")
 
-    # ─── العداد الدائم (آمن من الخيوط) ───
     def next_trade_id(self) -> str:
         with self._lock:
             self.counter["n"] = self.counter.get("n", 0) + 1
             self._save(self.counter_file, self.counter)
             return f"SIG-{self.counter['n']:04d}"
 
-    # ─── القائمة السوداء ───
     def is_blocked(self, symbol: str, cmf_1h: float) -> bool:
         with self._blacklist_lock:
             if symbol not in self.blacklist:
@@ -141,14 +132,10 @@ class SmartMemory:
 
     def add_failure(self, symbol: str, entry: float, sl: float):
         with self._blacklist_lock:
-            self.blacklist[symbol] = {
-                'entry': entry, 'sl': sl,
-                'time': datetime.now().isoformat()
-            }
+            self.blacklist[symbol] = {'entry': entry, 'sl': sl, 'time': datetime.now().isoformat()}
             self._save(self.blacklist_file, self.blacklist)
             print(f"⛔ {symbol}: أضيفت للقائمة السوداء")
 
-    # ─── الصفقات النشطة ───
     def is_active(self, symbol: str) -> bool:
         with self._active_lock:
             return symbol in self.active and self.active[symbol].get('status') != 'closed'
@@ -168,7 +155,6 @@ class SmartMemory:
         with self._active_lock:
             return dict(self.active)
 
-    # ─── السجل التاريخي ───
     def log_history(self, trade_id, symbol, result, entry, exit_price, pct, score):
         with self._history_lock:
             try:
@@ -193,11 +179,7 @@ def send_telegram(message: str):
     try:
         for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            requests.post(
-                url,
-                json={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "Markdown"},
-                timeout=15
-            )
+            requests.post(url, json={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "Markdown"}, timeout=15)
             time.sleep(0.5)
     except Exception as e:
         print(f"⚠️ Telegram error: {e}")
@@ -205,10 +187,7 @@ def send_telegram(message: str):
 # ═══════════════ الرادار ═══════════════
 class SigmaRadar:
     def __init__(self):
-        self.exchange = ccxt.kucoin({
-            'enableRateLimit': True,
-            'timeout': 30000,
-        })
+        self.exchange = ccxt.kucoin({'enableRateLimit': True, 'timeout': 30000})
         self.memory = SmartMemory()
 
     def fetch_btc(self):
@@ -282,7 +261,6 @@ class SigmaRadar:
             atr = df['ATR'].iloc[-1] if not pd.isna(df['ATR'].iloc[-1]) else price * 0.02
             atr_pct = (atr / price) * 100 if price > 0 else 2.0
 
-            # 🛡️ فلتر 1: رفض ذروة الشراء القصوى
             if regime in ("BULL", "NEUTRAL"):
                 if rsi >= MAX_RSI_ENTRY:
                     print(f"❌ RSI متطرف ({rsi:.1f})")
@@ -337,7 +315,6 @@ class SigmaRadar:
                 print(f"❌ نقاط منخفضة ({score})")
                 return None
 
-            # 🛡️ حساب الأهداف مع سقف SL
             sl_pct = max(2.0, min(MAX_SL_PCT, atr_pct * 1.5))
             tp1_pct = max(3.0, min(25.0, atr_pct * 2.0))
             tp2_pct = tp1_pct * 1.8
@@ -351,7 +328,6 @@ class SigmaRadar:
                 print(f"❌ R/R منخفض ({rr:.1f})")
                 return None
 
-            # 🎯 توليد رقم توصية فريد
             trade_id = self.memory.next_trade_id()
 
             self.memory.save_active(name, {
@@ -382,11 +358,8 @@ class SigmaRadar:
             print(f"⚠️ خطأ في {symbol}: {e}")
             return None
 
-    # ═══════════════════════════════════════════════════
-    # 🧠 التتبع الذكي – High/Low + متابعة TP2 بعد TP1
-    # ═══════════════════════════════════════════════════
     def track_active_signals(self):
-        print("  🔍 تتبع الصفقات المفتوحة (High/Low)...")
+        print("  🔍 تتبع الصفقات المفتوحة...")
         snapshot = self.memory.get_active_snapshot()
         for symbol, data in list(snapshot.items()):
             status = data.get('status')
@@ -396,7 +369,6 @@ class SigmaRadar:
                 ohlcv = self.exchange.fetch_ohlcv(f"{symbol}/USDT", timeframe='1h', limit=6)
                 if not ohlcv:
                     continue
-
                 highs = [c[2] for c in ohlcv]
                 lows = [c[3] for c in ohlcv]
                 max_price = max(highs)
@@ -409,7 +381,6 @@ class SigmaRadar:
                 trade_id = data.get('trade_id', symbol)
                 score = data.get('score', 0)
 
-                # 1️⃣ TP2 (أعلى هدف)
                 if max_price >= tp2:
                     profit_pct = ((tp2 - entry) / entry) * 100
                     send_telegram(
@@ -422,7 +393,6 @@ class SigmaRadar:
                     self.memory.log_history(trade_id, symbol, 'TP2', entry, tp2, profit_pct, score)
                     self.memory.close_active(symbol, 'closed')
 
-                # 2️⃣ TP1 (لا نُغلق الصفقة)
                 elif max_price >= tp1 and status != 'tp1_hit':
                     profit_pct = ((tp1 - entry) / entry) * 100
                     send_telegram(
@@ -437,7 +407,6 @@ class SigmaRadar:
                     data['status'] = 'tp1_hit'
                     self.memory.save_active(symbol, data)
 
-                # 3️⃣ SL
                 elif min_price <= sl:
                     loss_pct = ((sl - entry) / entry) * 100
                     send_telegram(
@@ -450,33 +419,25 @@ class SigmaRadar:
                     self.memory.log_history(trade_id, symbol, 'SL', entry, sl, loss_pct, score)
                     self.memory.add_failure(symbol, entry, sl)
                     self.memory.close_active(symbol, 'closed')
-
             except Exception as e:
                 print(f"⚠️ خطأ في تتبع {symbol}: {e}")
 
-    # ═══════════════════════════════════════════════════
-    # 🚀 التشغيل الرئيسي
-    # ═══════════════════════════════════════════════════
     def hunt(self):
         print("\n" + "="*60)
         print("  📡⚛️ SigmaRadar v2.3")
         print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*60)
 
-        # 1️⃣ تتبع الصفقات المفتوحة
         self.track_active_signals()
 
-        # 2️⃣ حالة السوق
         regime, btc_change = self.fetch_btc()
         print(f"  Market: {regime} | BTC: {btc_change:+.2f}%")
 
-        # 3️⃣ قائمة العملات
         symbols = self.get_symbols(300)
         if not symbols:
             print("  ❌ لا توجد عملات!")
             return
 
-        # 4️⃣ تحليل بالتوازي
         print(f"  🔍 تحليل {len(symbols)} عملة...")
         results = []
         with ThreadPoolExecutor(max_workers=10) as executor:
@@ -486,7 +447,6 @@ class SigmaRadar:
                 if result:
                     results.append(result)
 
-        # 5️⃣ ترتيب
         results.sort(key=lambda x: -x['score'])
         top = results[:TOP_N]
         if not top:
@@ -495,7 +455,6 @@ class SigmaRadar:
 
         print(f"  ✅ تم العثور على {len(top)} فرصة!")
 
-        # 6️⃣ بناء الرسالة
         msg = f"📡⚛️ *توصيات SigmaRadar الكمّية* — {datetime.now().strftime('%H:%M')}\n"
         msg += f"{'─'*30}\n"
         msg += f"السوق: {regime} | BTC: {btc_change:+.2f}%\n"
@@ -516,7 +475,6 @@ class SigmaRadar:
             msg += f"💡 {s['signals'][0] if s['signals'] else ''}\n"
             msg += f"{'─'*30}\n\n"
 
-        # 7️⃣ إرسال
         send_telegram(msg)
         print("  ✅ تم إرسال التوصيات إلى تليجرام.")
 
@@ -528,7 +486,6 @@ def run_hunt_background():
             print("⏳ الفحص قيد التشغيل بالفعل")
             return
         is_scanning = True
-
     def _run():
         global is_scanning
         try:
@@ -539,7 +496,6 @@ def run_hunt_background():
         finally:
             with _scan_lock:
                 is_scanning = False
-
     thread = threading.Thread(target=_run)
     thread.daemon = True
     thread.start()
@@ -562,7 +518,6 @@ def cron():
     run_hunt_background()
     return "OK", 200
 
-# ═══════════════ 📊 الصفقات النشطة ═══════════════
 @app.route('/status')
 def status():
     mem = SmartMemory()
@@ -594,7 +549,6 @@ def status():
     html += "</table></body></html>"
     return html, 200
 
-# ═══════════════ 📜 السجل التاريخي ═══════════════
 @app.route('/history')
 def history():
     try:
@@ -640,5 +594,22 @@ def history():
     html += "</table></body></html>"
     return html, 200
 
+# ═══════════════════════════════════════════════════════════
+# ═══ 🧹 كود التنظيف المؤقت – احذف هذا القسم كاملاً بعد الاستخدام ═══
+# ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    # 🗑️ حذف الصفقات النشطة + القائمة السوداء فقط
+    # (السجل التاريخي والعداد محفوظان)
+    _files_to_clean = ["sigma_active.json", "sigma_blacklist.json"]
+    for _f in _files_to_clean:
+        if os.path.exists(_f):
+            try:
+                os.remove(_f)
+                print(f"🗑️ تم حذف {_f}")
+            except Exception as _e:
+                print(f"⚠️ فشل حذف {_f}: {_e}")
+    
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
+# ═══════════════════════════════════════════════════════════
+# ═══ نهاية كود التنظيف ═══
+# ═══════════════════════════════════════════════════════════
