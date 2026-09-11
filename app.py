@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-📡⚛️ SigmaRadar v2.1 – تتبع ذكي باستخدام High/Low (حتى أثناء النوم)
+📡⚛️ SigmaRadar v2.2 – تتبع ذكي باستخدام High/Low + أرقام توصيات فريدة
 """
 
 import ccxt
@@ -25,6 +25,8 @@ MIN_RR = 1.8
 TOP_N = 8
 BLACKLIST_FILE = "sigma_blacklist.json"
 ACTIVE_FILE = "sigma_active.json"
+COUNTER_FILE = "sigma_counter.json"
+HISTORY_FILE = "sigma_history.json"
 
 app = Flask(__name__)
 is_scanning = False
@@ -80,8 +82,11 @@ class SmartMemory:
     def __init__(self, blacklist_file=BLACKLIST_FILE, active_file=ACTIVE_FILE):
         self.blacklist_file = blacklist_file
         self.active_file = active_file
+        self.counter_file = COUNTER_FILE
+        self.history_file = HISTORY_FILE
         self.blacklist = self._load(blacklist_file)
         self.active = self._load(active_file)
+        self.counter = self._load(self.counter_file) or {"n": 0}
 
     def _load(self, filename):
         try:
@@ -93,10 +98,18 @@ class SmartMemory:
     def _save(self, filename, data):
         try:
             with open(filename, 'w') as f:
-                json.dump(data, f, indent=2)
+                json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"⚠️ فشل حفظ {filename}: {e}")
 
+    # ─── العداد الدائم ───
+    def next_trade_id(self) -> str:
+        """يُنشئ رقم توصية فريد ومتزايد بشكل دائم (SIG-0001, SIG-0002, ...)."""
+        self.counter["n"] = self.counter.get("n", 0) + 1
+        self._save(self.counter_file, self.counter)
+        return f"SIG-{self.counter['n']:04d}"
+
+    # ─── القائمة السوداء ───
     def is_blocked(self, symbol: str, cmf_1h: float) -> bool:
         if symbol not in self.blacklist:
             return False
@@ -112,6 +125,7 @@ class SmartMemory:
         self._save(self.blacklist_file, self.blacklist)
         print(f"⛔ {symbol}: أضيفت للقائمة السوداء")
 
+    # ─── الصفقات النشطة ───
     def is_active(self, symbol: str) -> bool:
         return symbol in self.active and self.active[symbol].get('status') != 'closed'
 
@@ -124,7 +138,30 @@ class SmartMemory:
             self.active[symbol]['status'] = status
             self._save(self.active_file, self.active)
 
-# ═══════════════ دالة إرسال تليجرام ═══════════════
+    # ─── السجل التاريخي ───
+    def log_history(self, trade_id, symbol, result, entry, exit_price, pct, score):
+        try:
+            try:
+                with open(self.history_file, 'r') as f:
+                    hist = json.load(f)
+            except:
+                hist = []
+            hist.append({
+                'id': trade_id,
+                'symbol': symbol,
+                'result': result,        # 'TP1' / 'TP2' / 'SL'
+                'entry': entry,
+                'exit': exit_price,
+                'pct': round(pct, 2),
+                'score': score,
+                'time': datetime.now().isoformat()
+            })
+            with open(self.history_file, 'w') as f:
+                json.dump(hist, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"⚠️ history save: {e}")
+
+# ═══════════════ إرسال تليجرام ═══════════════
 def send_telegram(message: str):
     try:
         for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
@@ -134,7 +171,7 @@ def send_telegram(message: str):
     except Exception as e:
         print(f"⚠️ Telegram error: {e}")
 
-# ═══════════════ الرادار (متزامن) ═══════════════
+# ═══════════════ الرادار ═══════════════
 class SigmaRadar:
     def __init__(self):
         self.exchange = ccxt.kucoin({
@@ -269,7 +306,11 @@ class SigmaRadar:
                 print(f"❌ R/R منخفض ({rr:.1f})")
                 return None
 
+            # 🎯 توليد رقم توصية فريد
+            trade_id = self.memory.next_trade_id()
+
             self.memory.save_active(name, {
+                'trade_id': trade_id,
                 'entry': price, 'tp1': tp1, 'tp2': tp2, 'sl': sl,
                 'tp1_pct': round(tp1_pct,1), 'tp2_pct': round(tp2_pct,1), 'sl_pct': round(sl_pct,1),
                 'entry_time': datetime.now().isoformat(), 'status': 'active',
@@ -279,8 +320,9 @@ class SigmaRadar:
                 'signals': signals[:4], 'score': score
             })
 
-            print(f"✅ نقاط {score}")
+            print(f"✅ نقاط {score} | {trade_id}")
             return {
+                'trade_id': trade_id,
                 'symbol': name, 'score': score, 'price': price,
                 'change_24h': change_24h, 'volume_24h': volume_24h,
                 'drawdown': {'ath': ath, 'drawdown': round(dd,1), 'zone': zone},
@@ -296,46 +338,72 @@ class SigmaRadar:
             return None
 
     # ═══════════════════════════════════════════════════
-    # 🧠 التتبع الذكي – يتحقق من أعلى/أدنى سعر خلال 6 ساعات
+    # 🧠 التتبع الذكي – يستخدم High/Low + لا يُغلق عند TP1
     # ═══════════════════════════════════════════════════
     def track_active_signals(self):
-        print("  🔍 تتبع الصفقات المفتوحة (باستخدام High/Low)...")
+        print("  🔍 تتبع الصفقات المفتوحة (High/Low + أرقام)...")
         for symbol, data in list(self.memory.active.items()):
-            if data.get('status') == 'closed':
+            status = data.get('status')
+            if status == 'closed':
                 continue
             try:
-                # جلب آخر 6 شموع ساعة (لتغطية فترة السكون حتى 6 ساعات)
                 ohlcv = self.exchange.fetch_ohlcv(f"{symbol}/USDT", timeframe='1h', limit=6)
                 if not ohlcv:
                     continue
-                # استخراج أعلى وأدنى سعر خلال الـ 6 ساعات الماضية
-                highs = [c[2] for c in ohlcv]  # السعر الأعلى
-                lows = [c[3] for c in ohlcv]   # السعر الأدنى
+
+                highs = [c[2] for c in ohlcv]
+                lows = [c[3] for c in ohlcv]
                 max_price = max(highs)
                 min_price = min(lows)
-                current_price = ohlcv[-1][4]  # آخر سعر إغلاق
 
                 tp1 = data['tp1']
                 tp2 = data['tp2']
                 sl = data['sl']
                 entry = data['entry']
+                trade_id = data.get('trade_id', symbol)
+                score = data.get('score', 0)
 
-                # التحقق من TP2 أولاً (أعلى هدف)
+                # 1️⃣ تحقق من TP2 أولاً (أعلى هدف)
                 if max_price >= tp2:
-                    send_telegram(f"🚀 {symbol} حقق الهدف الثاني (TP2) عند أعلى سعر {max_price:.6f} 🎉")
+                    profit_pct = ((tp2 - entry) / entry) * 100
+                    send_telegram(
+                        f"🚀 `{trade_id}` *{symbol}* حقق الهدف الثاني TP2 🎉\n"
+                        f"💰 سعر الدخول: {entry:.6f}\n"
+                        f"🎯 سعر الهدف: {tp2:.6f} (أعلى: {max_price:.6f})\n"
+                        f"📈 الربح: +{profit_pct:.2f}%\n"
+                        f"⭐ النقاط: {score}"
+                    )
+                    self.memory.log_history(trade_id, symbol, 'TP2', entry, tp2, profit_pct, score)
                     self.memory.close_active(symbol, 'closed')
-                # ثم TP1 إذا لم يتحقق TP2
-                elif max_price >= tp1 and data.get('status') != 'tp1_hit':
-                    send_telegram(f"✅ {symbol} حقق الهدف الأول (TP1) عند أعلى سعر {max_price:.6f}")
-                    self.memory.close_active(symbol, 'tp1_hit')  # نغلقها لأنها حققت TP1
-                # ثم SL (وقف الخسارة)
+
+                # 2️⃣ تحقق من TP1 (لكن لا نُغلق الصفقة)
+                elif max_price >= tp1 and status != 'tp1_hit':
+                    profit_pct = ((tp1 - entry) / entry) * 100
+                    send_telegram(
+                        f"✅ `{trade_id}` *{symbol}* حقق الهدف الأول TP1\n"
+                        f"💰 سعر الدخول: {entry:.6f}\n"
+                        f"🎯 سعر الهدف: {tp1:.6f} (أعلى: {max_price:.6f})\n"
+                        f"📈 الربح: +{profit_pct:.2f}%\n"
+                        f"⏳ لا يزال قيد التتبع نحو TP2 ({tp2:.6f})\n"
+                        f"⭐ النقاط: {score}"
+                    )
+                    self.memory.log_history(trade_id, symbol, 'TP1', entry, tp1, profit_pct, score)
+                    data['status'] = 'tp1_hit'
+                    self.memory.save_active(symbol, data)
+
+                # 3️⃣ تحقق من SL
                 elif min_price <= sl:
-                    send_telegram(f"❌ {symbol} ضرب وقف الخسارة (SL) عند أدنى سعر {min_price:.6f}")
+                    loss_pct = ((sl - entry) / entry) * 100
+                    send_telegram(
+                        f"❌ `{trade_id}` *{symbol}* ضرب وقف الخسارة SL\n"
+                        f"💰 سعر الدخول: {entry:.6f}\n"
+                        f"🛑 سعر الوقف: {sl:.6f} (أدنى: {min_price:.6f})\n"
+                        f"📉 الخسارة: {loss_pct:.2f}%\n"
+                        f"⭐ النقاط: {score}"
+                    )
+                    self.memory.log_history(trade_id, symbol, 'SL', entry, sl, loss_pct, score)
                     self.memory.add_failure(symbol, entry, sl)
                     self.memory.close_active(symbol, 'closed')
-                else:
-                    # إذا كان السعر الحالي لا يزال ضمن النطاق ولا شيء تغير
-                    pass
 
             except Exception as e:
                 print(f"⚠️ خطأ في تتبع {symbol}: {e}")
@@ -345,11 +413,11 @@ class SigmaRadar:
     # ═══════════════════════════════════════════════════
     def hunt(self):
         print("\n" + "="*60)
-        print("  📡⚛️ SigmaRadar v2.1 (تتبع ذكي High/Low)")
+        print("  📡⚛️ SigmaRadar v2.2 (Trade IDs + High/Low Tracking)")
         print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*60)
 
-        # 1️⃣ تتبع الصفقات المفتوحة (باستخدام High/Low)
+        # 1️⃣ تتبع الصفقات المفتوحة
         self.track_active_signals()
 
         # 2️⃣ جلب حالة السوق
@@ -389,7 +457,7 @@ class SigmaRadar:
         msg += f"{'─'*30}\n\n"
 
         for i, s in enumerate(top, 1):
-            msg += f"*{i}. {s['symbol']}*   ⭐ {s['score']} نقطة\n"
+            msg += f"*{i}. {s['symbol']}*   ⭐ {s['score']} نقطة   `{s['trade_id']}`\n"
             msg += f"💰 السعر: {s['price']:.6f} USDT\n"
             msg += f"📈 التغير 24h: {s['change_24h']:+.1f}%\n"
             msg += f"💵 حجم التداول: {s['volume_24h']:,.0f}$\n"
@@ -402,10 +470,9 @@ class SigmaRadar:
             msg += f"💡 {s['signals'][0] if s['signals'] else ''}\n"
             msg += f"{'─'*30}\n\n"
 
-        # 7️⃣ إرسال التوصيات إلى تليجرام
+        # 7️⃣ إرسال التوصيات
         send_telegram(msg)
         print("  ✅ تم إرسال التوصيات إلى تليجرام.")
-
 
 # ═══════════════ نقاط النهاية Flask ═══════════════
 def run_hunt_background():
@@ -429,7 +496,7 @@ def run_hunt_background():
 
 @app.route('/')
 def home():
-    return "📡⚛️ SigmaRadar v2.1 (تتبع ذكي High/Low) يعمل!", 200
+    return "📡⚛️ SigmaRadar v2.2 (Trade IDs) يعمل!", 200
 
 @app.route('/health')
 def health():
@@ -444,6 +511,80 @@ def run():
 def cron():
     run_hunt_background()
     return "OK", 200
+
+# ═══════════════ 📊 عرض الصفقات النشطة ═══════════════
+@app.route('/status')
+def status():
+    mem = SmartMemory()
+    active = {k: v for k, v in mem.active.items() if v.get('status') != 'closed'}
+    if not active:
+        return "<h3 style='font-family:sans-serif'>لا توجد صفقات نشطة حالياً</h3>", 200
+    html = """
+    <html><head><title>SigmaRadar - Active Trades</title></head>
+    <body style='font-family:sans-serif;padding:20px;background:#111;color:#eee'>
+    <h2>📊 الصفقات النشطة</h2>
+    <table border='1' cellpadding='8' style='border-collapse:collapse;width:100%'>
+    <tr style='background:#222'>
+      <th>ID</th><th>العملة</th><th>الحالة</th><th>الدخول</th>
+      <th>TP1</th><th>TP2</th><th>SL</th><th>النقاط</th>
+    </tr>
+    """
+    for sym, d in active.items():
+        html += (
+            f"<tr><td><b>{d.get('trade_id','-')}</b></td>"
+            f"<td>{sym}</td>"
+            f"<td>{d.get('status','-')}</td>"
+            f"<td>{d['entry']:.6f}</td>"
+            f"<td>{d['tp1']:.6f}</td>"
+            f"<td>{d['tp2']:.6f}</td>"
+            f"<td>{d['sl']:.6f}</td>"
+            f"<td>{d.get('score','-')}</td></tr>"
+        )
+    html += "</table></body></html>"
+    return html, 200
+
+# ═══════════════ 📜 عرض السجل التاريخي ═══════════════
+@app.route('/history')
+def history():
+    try:
+        with open(HISTORY_FILE, 'r') as f:
+            hist = json.load(f)
+    except:
+        hist = []
+    if not hist:
+        return "<h3 style='font-family:sans-serif'>لا يوجد سجل بعد</h3>", 200
+    tp1 = sum(1 for h in hist if h['result'] == 'TP1')
+    tp2 = sum(1 for h in hist if h['result'] == 'TP2')
+    sl = sum(1 for h in hist if h['result'] == 'SL')
+    total = len(hist)
+    wins = tp1 + tp2
+    wr = (wins / total * 100) if total > 0 else 0
+    html = f"""
+    <html><head><title>SigmaRadar - History</title></head>
+    <body style='font-family:sans-serif;padding:20px;background:#111;color:#eee'>
+    <h2>📜 السجل التاريخي</h2>
+    <p>إجمالي: <b>{total}</b> | ✅ TP1: <b>{tp1}</b> | 🚀 TP2: <b>{tp2}</b> | ❌ SL: <b>{sl}</b> | 🎯 Win Rate: <b>{wr:.1f}%</b></p>
+    <table border='1' cellpadding='8' style='border-collapse:collapse;width:100%'>
+    <tr style='background:#222'>
+      <th>ID</th><th>العملة</th><th>النتيجة</th><th>الدخول</th>
+      <th>الخروج</th><th>%</th><th>النقاط</th><th>التاريخ</th>
+    </tr>
+    """
+    for h in reversed(hist[-100:]):
+        color = '#2a5' if h['result'] in ('TP1','TP2') else '#a33'
+        html += (
+            f"<tr style='background:{color}22'>"
+            f"<td><b>{h['id']}</b></td>"
+            f"<td>{h['symbol']}</td>"
+            f"<td>{h['result']}</td>"
+            f"<td>{h['entry']:.6f}</td>"
+            f"<td>{h['exit']:.6f}</td>"
+            f"<td>{h['pct']:+.2f}%</td>"
+            f"<td>{h.get('score','-')}</td>"
+            f"<td>{h['time'][:16]}</td></tr>"
+        )
+    html += "</table></body></html>"
+    return html, 200
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
