@@ -594,17 +594,5 @@ def history():
     html += "</table></body></html>"
     return html, 200
 
-# ═══ 🧹 كود التنظيف المؤقت – احذف هذا القسم كاملاً بعد الاستخدام ═══
 if __name__ == "__main__":
-    # 🗑️ حذف الصفقات النشطة + القائمة السوداء فقط
-    _files_to_clean = ["sigma_active.json", "sigma_blacklist.json"]
-    for _f in _files_to_clean:
-        if os.path.exists(_f):
-            try:
-                os.remove(_f)
-                print(f"🗑️ تم حذف {_f}")
-            except Exception as _e:
-                print(f"⚠️ فشل حذف {_f}: {_e}")
-    
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
-# ═══ نهاية كود التنظيف ═══
