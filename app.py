@@ -3,7 +3,7 @@
 """
 📡⚛️ SigmaRadar v2.3 – تتبع ذكي + أرقام فريدة + حماية كاملة
 """
-
+"عاش هتلر "
 import ccxt
 import pandas as pd
 import numpy as np
