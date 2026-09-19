@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-📡⚛️ SigmaRadar v2.3 – تتبع ذكي + أرقام فريدة + حماية كاملة
+📡⚛️ SigmaRadar v2.4 – تتبع ذكي + إصلاح Rate Limit
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+👤 تصميم وتطوير: المالك
+📅 تاريخ الإنشاء: 2026-09-16
+🔄 آخر تحديث: 2026-09-19
+🔒 جميع الحقوق محفوظة © 2026
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+الإصلاحات المدمجة:
+1. ✅ تقليل العمال من 10 إلى 3 (تجنب Rate Limit)
+2. ✅ تأخير عشوائي في analyze() لتوزيع الطلبات
+3. ✅ دالة _safe_fetch مع retry تلقائي عند 429
+4. ✅ حظر مؤقت (7 أيام) بدل دائم
+5. ✅ رفع الحظر عند تحسن CMF
 """
-"عاش هتلر "
+
 import ccxt
 import pandas as pd
 import numpy as np
@@ -11,7 +24,8 @@ import json
 import os
 import threading
 import time
-from datetime import datetime
+import random
+from datetime import datetime, timedelta
 from flask import Flask
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
@@ -26,6 +40,15 @@ TOP_N = 8
 MAX_SL_PCT = 8.0
 MAX_RSI_ENTRY = 72.0
 MAX_STOCH_ENTRY = 98.0
+
+# 🔧 إعدادات Rate Limit
+MAX_WORKERS = 3           # عدد الخيوط المتوازية (كان 10)
+DELAY_MIN = 0.1           # أدنى تأخير
+DELAY_MAX = 0.3           # أقصى تأخير
+MAX_RETRIES = 3           # عدد محاولات إعادة الطلب
+
+# 🧊 إعدادات الحظر
+BLACKLIST_DAYS = 7        # مدة الحظر بالأيام
 
 BLACKLIST_FILE = "sigma_blacklist.json"
 ACTIVE_FILE = "sigma_active.json"
@@ -123,18 +146,39 @@ class SmartMemory:
         with self._blacklist_lock:
             if symbol not in self.blacklist:
                 return False
+            
+            entry = self.blacklist[symbol]
+            
+            # 🧊 رفع الحظر بعد انتهاء المدة
+            if 'expires' in entry:
+                try:
+                    if datetime.now() > datetime.fromisoformat(entry['expires']):
+                        print(f"🔓 {symbol}: انتهى الحظر — متاح من جديد")
+                        del self.blacklist[symbol]
+                        self._save(self.blacklist_file, self.blacklist)
+                        return False
+                except:
+                    pass
+            
+            # 🔓 رفع الحظر عند تحسن CMF
             if cmf_1h > 0.2:
                 print(f"🔓 {symbol}: تم رفع الحظر – CMF={cmf_1h:.3f}")
                 del self.blacklist[symbol]
                 self._save(self.blacklist_file, self.blacklist)
                 return False
+            
             return True
 
     def add_failure(self, symbol: str, entry: float, sl: float):
         with self._blacklist_lock:
-            self.blacklist[symbol] = {'entry': entry, 'sl': sl, 'time': datetime.now().isoformat()}
+            self.blacklist[symbol] = {
+                'entry': entry, 
+                'sl': sl, 
+                'time': datetime.now().isoformat(),
+                'expires': (datetime.now() + timedelta(days=BLACKLIST_DAYS)).isoformat()
+            }
             self._save(self.blacklist_file, self.blacklist)
-            print(f"⛔ {symbol}: أضيفت للقائمة السوداء")
+            print(f"⛔ {symbol}: محظور {BLACKLIST_DAYS} أيام")
 
     def is_active(self, symbol: str) -> bool:
         with self._active_lock:
@@ -187,13 +231,34 @@ def send_telegram(message: str):
 # ═══════════════ الرادار ═══════════════
 class SigmaRadar:
     def __init__(self):
-        self.exchange = ccxt.kucoin({'enableRateLimit': True, 'timeout': 30000})
+        self.exchange = ccxt.kucoin({
+            'enableRateLimit': True,
+            'timeout': 30000,
+        })
         self.memory = SmartMemory()
+
+    def _safe_fetch(self, func, *args, retries=MAX_RETRIES, **kwargs):
+        """🔧 تنفيذ آمن مع إعادة المحاولة عند Rate Limit."""
+        for attempt in range(retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                err = str(e).lower()
+                if '429' in err or 'too many' in err or 'rate limit' in err:
+                    wait = (attempt + 1) * 2
+                    print(f"⏳ Rate Limit — انتظار {wait}s (محاولة {attempt+1}/{retries})")
+                    time.sleep(wait)
+                else:
+                    raise
+        print(f"❌ فشلت كل المحاولات")
+        return None
 
     def fetch_btc(self):
         try:
             print("  📡 جلب بيانات BTC...")
-            ticker = self.exchange.fetch_ticker('BTC/USDT')
+            ticker = self._safe_fetch(self.exchange.fetch_ticker, 'BTC/USDT')
+            if not ticker:
+                return "NEUTRAL", 0.0
             change = ticker.get('percentage', 0.0)
             if change > 1.0: regime = "BULL"
             elif change < -1.0: regime = "BEAR"
@@ -207,7 +272,9 @@ class SigmaRadar:
     def get_symbols(self, limit=300):
         try:
             print("  📡 جلب قائمة العملات من KuCoin...")
-            tickers = self.exchange.fetch_tickers()
+            tickers = self._safe_fetch(self.exchange.fetch_tickers)
+            if not tickers:
+                return []
             symbols = []
             for sym, t in tickers.items():
                 if not sym.endswith('/USDT'): continue
@@ -223,9 +290,16 @@ class SigmaRadar:
 
     def analyze(self, symbol: str, regime: str):
         try:
+            # 🔧 تأخير عشوائي لتجنب Rate Limit
+            time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+            
             print(f"    🔍 تحليل {symbol}...", end=' ')
-            ohlcv_1h = self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=200)
-            ohlcv_1d = self.exchange.fetch_ohlcv(symbol, timeframe='1d', limit=90)
+            
+            # 🔧 استخدام _safe_fetch للطلبات
+            ohlcv_1h = self._safe_fetch(self.exchange.fetch_ohlcv, symbol, timeframe='1h', limit=200)
+            time.sleep(random.uniform(0.05, 0.15))  # تأخير بين الطلبين
+            ohlcv_1d = self._safe_fetch(self.exchange.fetch_ohlcv, symbol, timeframe='1d', limit=90)
+            
             if not ohlcv_1h or len(ohlcv_1h) < 50:
                 print("❌ بيانات غير كافية")
                 return None
@@ -251,7 +325,10 @@ class SigmaRadar:
                 print("🔄 نشط")
                 return None
 
-            ticker = self.exchange.fetch_ticker(symbol)
+            ticker = self._safe_fetch(self.exchange.fetch_ticker, symbol)
+            if not ticker:
+                print("❌ فشل جلب ticker")
+                return None
             change_24h = ticker.get('percentage', 0.0)
             volume_24h = ticker.get('quoteVolume', 0)
 
@@ -261,6 +338,7 @@ class SigmaRadar:
             atr = df['ATR'].iloc[-1] if not pd.isna(df['ATR'].iloc[-1]) else price * 0.02
             atr_pct = (atr / price) * 100 if price > 0 else 2.0
 
+            # 🛡️ فلتر 1: رفض ذروة الشراء
             if regime in ("BULL", "NEUTRAL"):
                 if rsi >= MAX_RSI_ENTRY:
                     print(f"❌ RSI متطرف ({rsi:.1f})")
@@ -366,7 +444,7 @@ class SigmaRadar:
             if status == 'closed':
                 continue
             try:
-                ohlcv = self.exchange.fetch_ohlcv(f"{symbol}/USDT", timeframe='1h', limit=6)
+                ohlcv = self._safe_fetch(self.exchange.fetch_ohlcv, f"{symbol}/USDT", timeframe='1h', limit=6)
                 if not ohlcv:
                     continue
                 highs = [c[2] for c in ohlcv]
@@ -424,7 +502,7 @@ class SigmaRadar:
 
     def hunt(self):
         print("\n" + "="*60)
-        print("  📡⚛️ SigmaRadar v2.3")
+        print("  📡⚛️ SigmaRadar v2.4")
         print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*60)
 
@@ -438,14 +516,15 @@ class SigmaRadar:
             print("  ❌ لا توجد عملات!")
             return
 
-        print(f"  🔍 تحليل {len(symbols)} عملة...")
+        print(f"  🔍 تحليل {len(symbols)} عملة (عمال: {MAX_WORKERS})...")
         results = []
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(self.analyze, sym, regime): sym for sym in symbols}
             for future in as_completed(futures):
                 result = future.result()
                 if result:
                     results.append(result)
+                time.sleep(0.05)  # 🔧 تأخير صغير بين النتائج
 
         results.sort(key=lambda x: -x['score'])
         top = results[:TOP_N]
@@ -478,7 +557,7 @@ class SigmaRadar:
         send_telegram(msg)
         print("  ✅ تم إرسال التوصيات إلى تليجرام.")
 
-# ═══════════════ Flask Endpoints ═══════════════
+# ═══════════════ نقاط النهاية ═══════════════
 def run_hunt_background():
     global is_scanning
     with _scan_lock:
@@ -486,6 +565,7 @@ def run_hunt_background():
             print("⏳ الفحص قيد التشغيل بالفعل")
             return
         is_scanning = True
+
     def _run():
         global is_scanning
         try:
@@ -496,13 +576,14 @@ def run_hunt_background():
         finally:
             with _scan_lock:
                 is_scanning = False
+
     thread = threading.Thread(target=_run)
     thread.daemon = True
     thread.start()
 
 @app.route('/')
 def home():
-    return "📡⚛️ SigmaRadar v2.3 يعمل!", 200
+    return "📡⚛️ SigmaRadar v2.4 يعمل!", 200
 
 @app.route('/health')
 def health():
