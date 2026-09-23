@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-📡⚛️ SigmaRadar v2.5 – تتبع ذكي + تحسين جودة الإشارات
+📡⚛️ SigmaRadar v2.5.1 – تتبع ذكي + إصلاح Bug الحفظ
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 👤 تصميم وتطوير: المالك
 📅 تاريخ الإنشاء: 2026-09-16
@@ -9,11 +9,12 @@
 🔒 جميع الحقوق محفوظة © 2026
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-التحديثات في v2.5:
-1. ✅ TOP_N: 8 → 4 (جودة أعلى)
-2. ✅ MIN_SCORE: 40 → 50 (فلترة أقوى)
-3. ✅ فلترة إضافية مع احتياطي
-4. ✅ تحليل Win Rate حسب Score في /history
+التحديثات في v2.5.1:
+1. ✅ إصلاح Bug: 174 صفقة تُحفظ بينما 4 فقط تُرسل
+2. ✅ نقل save_active بعد الفلترة النهائية
+3. ✅ حفظ TOP_N فقط (4 صفقات)
+4. ✅ تحسين Rate Limit (عمال: 3 → 2)
+5. ✅ زيادة التأخير لتجنب 429
 """
 
 import ccxt
@@ -33,17 +34,17 @@ import requests
 TELEGRAM_TOKEN = "8892386642:AAFrH8mz-XQjYDnsjY2RkPoJz7oMcbIDTdw"
 CHAT_ID = "6499356593"
 MIN_VOLUME = 100_000
-MIN_SCORE = 50            # ✅ رُفع من 40
+MIN_SCORE = 50
 MIN_RR = 1.8
-TOP_N = 4                 # ✅ خُفّض من 8
+TOP_N = 4
 MAX_SL_PCT = 8.0
 MAX_RSI_ENTRY = 72.0
 MAX_STOCH_ENTRY = 98.0
 
-# 🔧 Rate Limit
-MAX_WORKERS = 3
-DELAY_MIN = 0.1
-DELAY_MAX = 0.3
+# 🔧 Rate Limit (مُحسّن v2.5.1)
+MAX_WORKERS = 2           # من 3 إلى 2
+DELAY_MIN = 0.15          # من 0.1
+DELAY_MAX = 0.40          # من 0.3
 MAX_RETRIES = 3
 
 # 🧊 الحظر
@@ -280,6 +281,7 @@ class SigmaRadar:
             return []
 
     def analyze(self, symbol: str, regime: str):
+        """✅ [v2.5.1] تحليل فقط — بدون حفظ في active"""
         try:
             time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
             print(f"    🔍 تحليل {symbol}...", end=' ')
@@ -393,22 +395,10 @@ class SigmaRadar:
                 print(f"❌ R/R منخفض ({rr:.1f})")
                 return None
 
-            trade_id = self.memory.next_trade_id()
+            # ✅ [v2.5.1] لا نحفظ في active هنا — سيُحفظ فقط المقبولون نهائياً
+            print(f"✅ نقاط {score} (مرشح)")
 
-            self.memory.save_active(name, {
-                'trade_id': trade_id,
-                'entry': price, 'tp1': tp1, 'tp2': tp2, 'sl': sl,
-                'tp1_pct': round(tp1_pct,1), 'tp2_pct': round(tp2_pct,1), 'sl_pct': round(sl_pct,1),
-                'entry_time': datetime.now().isoformat(), 'status': 'active',
-                'cmf_1h': cmf_1h, 'change_24h': change_24h, 'volume_24h': volume_24h,
-                'drawdown': round(dd,1), 'zone': zone,
-                'rsi': round(rsi,1), 'adx': round(adx,1), 'stoch_k': round(stoch_k,1),
-                'signals': signals[:4], 'score': score
-            })
-
-            print(f"✅ نقاط {score} | {trade_id}")
             return {
-                'trade_id': trade_id,
                 'symbol': name, 'score': score, 'price': price,
                 'change_24h': change_24h, 'volume_24h': volume_24h,
                 'drawdown': {'ath': ath, 'drawdown': round(dd,1), 'zone': zone},
@@ -489,7 +479,7 @@ class SigmaRadar:
 
     def hunt(self):
         print("\n" + "="*60)
-        print("  📡⚛️ SigmaRadar v2.5")
+        print("  📡⚛️ SigmaRadar v2.5.1")
         print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*60)
 
@@ -514,24 +504,47 @@ class SigmaRadar:
                 time.sleep(0.05)
 
         results.sort(key=lambda x: -x['score'])
-        
-        # ✅ [جديد v2.5] فلترة إضافية بجودة عالية
+
+        # ✅ فلترة إضافية
         high_quality = [r for r in results if r['score'] >= MIN_SCORE]
-        
+
         # إذا أقل من 2، اقبل من (MIN_SCORE - 5) بحذر
         if len(high_quality) < 2:
             extra = [r for r in results if MIN_SCORE - 5 <= r['score'] < MIN_SCORE][:2]
             if extra:
                 print(f"  💡 إضافة {len(extra)} توصية احتياطية (Score 45-49)")
             high_quality += extra
-        
+
         top = high_quality[:TOP_N]
-        
+
         if not top:
             print("  📭 لا توجد فرص بجودة كافية.")
             return
 
         print(f"  ✅ تم العثور على {len(top)} فرصة (من أصل {len(results)} مرشحة)!")
+
+        # ✅ [v2.5.1] الحفظ بعد الفلترة النهائية — TOP_N فقط!
+        for s in top:
+            s['trade_id'] = self.memory.next_trade_id()
+            self.memory.save_active(s['symbol'], {
+                'trade_id': s['trade_id'],
+                'entry': s['price'],
+                'tp1': s['tp1'], 'tp2': s['tp2'], 'sl': s['sl'],
+                'tp1_pct': s['tp1_pct'],
+                'tp2_pct': s['tp2_pct'],
+                'sl_pct': s['sl_pct'],
+                'entry_time': datetime.now().isoformat(),
+                'status': 'active',
+                'cmf_1h': s['cmf_1h'],
+                'change_24h': s['change_24h'],
+                'volume_24h': s['volume_24h'],
+                'drawdown': s['drawdown']['drawdown'],
+                'zone': s['drawdown']['zone'],
+                'rsi': s['rsi'], 'adx': s['adx'], 'stoch_k': s['stoch_k'],
+                'signals': s['signals'],
+                'score': s['score']
+            })
+            print(f"  💾 حُفظ {s['symbol']} | {s['trade_id']}")
 
         msg = f"📡⚛️ *توصيات SigmaRadar الكمّية* — {datetime.now().strftime('%H:%M')}\n"
         msg += f"{'─'*30}\n"
@@ -582,7 +595,7 @@ def run_hunt_background():
 
 @app.route('/')
 def home():
-    return "📡⚛️ SigmaRadar v2.5 يعمل!", 200
+    return "📡⚛️ SigmaRadar v2.5.1 يعمل!", 200
 
 @app.route('/health')
 def health():
@@ -638,7 +651,7 @@ def history():
         hist = []
     if not hist:
         return "<h3 style='font-family:sans-serif'>لا يوجد سجل بعد</h3>", 200
-    
+
     tp1 = sum(1 for h in hist if h['result'] == 'TP1')
     tp2 = sum(1 for h in hist if h['result'] == 'TP2')
     sl = sum(1 for h in hist if h['result'] == 'SL')
@@ -646,7 +659,7 @@ def history():
     wins = tp1 + tp2
     wr = (wins / total * 100) if total > 0 else 0
     net = sum(h['pct'] for h in hist)
-    
+
     html = f"""
     <html><head><title>SigmaRadar - History</title></head>
     <body style='font-family:sans-serif;padding:20px;background:#111;color:#eee'>
@@ -655,26 +668,16 @@ def history():
     | ❌ SL: <b>{sl}</b> | 🎯 Win Rate: <b>{wr:.1f}%</b>
     | 📈 صافي: <b>{net:+.2f}%</b></p>
     """
-    
-    # ✅ [جديد v2.5] تحليل Win Rate حسب Score
-    score_ranges = {
-        '50+': [],
-        '45-49': [],
-        '40-44': [],
-        '< 40': []
-    }
+
+    score_ranges = {'50+': [], '45-49': [], '40-44': [], '< 40': []}
     for h in hist:
         s = h.get('score', 0)
         result = h['result']
-        if s >= 50:
-            score_ranges['50+'].append(result)
-        elif s >= 45:
-            score_ranges['45-49'].append(result)
-        elif s >= 40:
-            score_ranges['40-44'].append(result)
-        else:
-            score_ranges['< 40'].append(result)
-    
+        if s >= 50: score_ranges['50+'].append(result)
+        elif s >= 45: score_ranges['45-49'].append(result)
+        elif s >= 40: score_ranges['40-44'].append(result)
+        else: score_ranges['< 40'].append(result)
+
     html += """
     <h2 style='margin-top:30px'>📊 Win Rate حسب Score</h2>
     <table border='1' cellpadding='8' style='border-collapse:collapse;width:100%'>
@@ -699,7 +702,7 @@ def history():
             f"<td><b>{wr_r:.1f}%</b></td></tr>"
         )
     html += "</table>"
-    
+
     html += """
     <h2 style='margin-top:30px'>📋 السجل الكامل</h2>
     <table border='1' cellpadding='8' style='border-collapse:collapse;width:100%'>
