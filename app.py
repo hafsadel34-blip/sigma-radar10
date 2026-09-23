@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-📡⚛️ SigmaRadar v2.4 – تتبع ذكي + إصلاح Rate Limit
+📡⚛️ SigmaRadar v2.5 – تتبع ذكي + تحسين جودة الإشارات
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 👤 تصميم وتطوير: المالك
 📅 تاريخ الإنشاء: 2026-09-16
-🔄 آخر تحديث: 2026-09-19
+🔄 آخر تحديث: 2026-09-23
 🔒 جميع الحقوق محفوظة © 2026
-"عاشت المنظومه وعاش الفوهرر "     
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-الإصلاحات المدمجة:
-1. ✅ تقليل العمال من 10 إلى 3 (تجنب Rate Limit)
-2. ✅ تأخير عشوائي في analyze() لتوزيع الطلبات
-3. ✅ دالة _safe_fetch مع retry تلقائي عند 429
-4. ✅ حظر مؤقت (7 أيام) بدل دائم
-5. ✅ رفع الحظر عند تحسن CMF
+التحديثات في v2.5:
+1. ✅ TOP_N: 8 → 4 (جودة أعلى)
+2. ✅ MIN_SCORE: 40 → 50 (فلترة أقوى)
+3. ✅ فلترة إضافية مع احتياطي
+4. ✅ تحليل Win Rate حسب Score في /history
 """
 
 import ccxt
@@ -35,21 +33,21 @@ import requests
 TELEGRAM_TOKEN = "8892386642:AAFrH8mz-XQjYDnsjY2RkPoJz7oMcbIDTdw"
 CHAT_ID = "6499356593"
 MIN_VOLUME = 100_000
-MIN_SCORE = 40
+MIN_SCORE = 50            # ✅ رُفع من 40
 MIN_RR = 1.8
-TOP_N = 8
+TOP_N = 4                 # ✅ خُفّض من 8
 MAX_SL_PCT = 8.0
 MAX_RSI_ENTRY = 72.0
 MAX_STOCH_ENTRY = 98.0
 
-# 🔧 إعدادات Rate Limit
-MAX_WORKERS = 3           # عدد الخيوط المتوازية (كان 10)
-DELAY_MIN = 0.1           # أدنى تأخير
-DELAY_MAX = 0.3           # أقصى تأخير
-MAX_RETRIES = 3           # عدد محاولات إعادة الطلب
+# 🔧 Rate Limit
+MAX_WORKERS = 3
+DELAY_MIN = 0.1
+DELAY_MAX = 0.3
+MAX_RETRIES = 3
 
-# 🧊 إعدادات الحظر
-BLACKLIST_DAYS = 7        # مدة الحظر بالأيام
+# 🧊 الحظر
+BLACKLIST_DAYS = 7
 
 BLACKLIST_FILE = "sigma_blacklist.json"
 ACTIVE_FILE = "sigma_active.json"
@@ -60,7 +58,7 @@ app = Flask(__name__)
 is_scanning = False
 _scan_lock = threading.Lock()
 
-# ═══════════════ حساب المؤشرات ═══════════════
+# ═══════════════ المؤشرات ═══════════════
 def calc_rsi(close, period=14):
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -147,34 +145,27 @@ class SmartMemory:
         with self._blacklist_lock:
             if symbol not in self.blacklist:
                 return False
-            
             entry = self.blacklist[symbol]
-            
-            # 🧊 رفع الحظر بعد انتهاء المدة
             if 'expires' in entry:
                 try:
                     if datetime.now() > datetime.fromisoformat(entry['expires']):
-                        print(f"🔓 {symbol}: انتهى الحظر — متاح من جديد")
+                        print(f"🔓 {symbol}: انتهى الحظر")
                         del self.blacklist[symbol]
                         self._save(self.blacklist_file, self.blacklist)
                         return False
                 except:
                     pass
-            
-            # 🔓 رفع الحظر عند تحسن CMF
             if cmf_1h > 0.2:
                 print(f"🔓 {symbol}: تم رفع الحظر – CMF={cmf_1h:.3f}")
                 del self.blacklist[symbol]
                 self._save(self.blacklist_file, self.blacklist)
                 return False
-            
             return True
 
     def add_failure(self, symbol: str, entry: float, sl: float):
         with self._blacklist_lock:
             self.blacklist[symbol] = {
-                'entry': entry, 
-                'sl': sl, 
+                'entry': entry, 'sl': sl,
                 'time': datetime.now().isoformat(),
                 'expires': (datetime.now() + timedelta(days=BLACKLIST_DAYS)).isoformat()
             }
@@ -219,7 +210,7 @@ class SmartMemory:
             except Exception as e:
                 print(f"⚠️ history save: {e}")
 
-# ═══════════════ إرسال تليجرام ═══════════════
+# ═══════════════ تليجرام ═══════════════
 def send_telegram(message: str):
     try:
         for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
@@ -239,7 +230,6 @@ class SigmaRadar:
         self.memory = SmartMemory()
 
     def _safe_fetch(self, func, *args, retries=MAX_RETRIES, **kwargs):
-        """🔧 تنفيذ آمن مع إعادة المحاولة عند Rate Limit."""
         for attempt in range(retries):
             try:
                 return func(*args, **kwargs)
@@ -247,7 +237,7 @@ class SigmaRadar:
                 err = str(e).lower()
                 if '429' in err or 'too many' in err or 'rate limit' in err:
                     wait = (attempt + 1) * 2
-                    print(f"⏳ Rate Limit — انتظار {wait}s (محاولة {attempt+1}/{retries})")
+                    print(f"⏳ Rate Limit — انتظار {wait}s ({attempt+1}/{retries})")
                     time.sleep(wait)
                 else:
                     raise
@@ -272,7 +262,7 @@ class SigmaRadar:
 
     def get_symbols(self, limit=300):
         try:
-            print("  📡 جلب قائمة العملات من KuCoin...")
+            print("  📡 جلب قائمة العملات...")
             tickers = self._safe_fetch(self.exchange.fetch_tickers)
             if not tickers:
                 return []
@@ -291,16 +281,13 @@ class SigmaRadar:
 
     def analyze(self, symbol: str, regime: str):
         try:
-            # 🔧 تأخير عشوائي لتجنب Rate Limit
             time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-            
             print(f"    🔍 تحليل {symbol}...", end=' ')
-            
-            # 🔧 استخدام _safe_fetch للطلبات
+
             ohlcv_1h = self._safe_fetch(self.exchange.fetch_ohlcv, symbol, timeframe='1h', limit=200)
-            time.sleep(random.uniform(0.05, 0.15))  # تأخير بين الطلبين
+            time.sleep(random.uniform(0.05, 0.15))
             ohlcv_1d = self._safe_fetch(self.exchange.fetch_ohlcv, symbol, timeframe='1d', limit=90)
-            
+
             if not ohlcv_1h or len(ohlcv_1h) < 50:
                 print("❌ بيانات غير كافية")
                 return None
@@ -339,7 +326,6 @@ class SigmaRadar:
             atr = df['ATR'].iloc[-1] if not pd.isna(df['ATR'].iloc[-1]) else price * 0.02
             atr_pct = (atr / price) * 100 if price > 0 else 2.0
 
-            # 🛡️ فلتر 1: رفض ذروة الشراء
             if regime in ("BULL", "NEUTRAL"):
                 if rsi >= MAX_RSI_ENTRY:
                     print(f"❌ RSI متطرف ({rsi:.1f})")
@@ -465,7 +451,7 @@ class SigmaRadar:
                     send_telegram(
                         f"🚀 `{trade_id}` *{symbol}* حقق الهدف الثاني TP2 🎉\n"
                         f"💰 سعر الدخول: {entry:.6f}\n"
-                        f"🎯 سعر الهدف: {tp2:.6f} (أعلى: {max_price:.6f})\n"
+                        f"🎯 سعر الهدف: {tp2:.6f}\n"
                         f"📈 الربح: +{profit_pct:.2f}%\n"
                         f"⭐ النقاط: {score}"
                     )
@@ -477,9 +463,9 @@ class SigmaRadar:
                     send_telegram(
                         f"✅ `{trade_id}` *{symbol}* حقق الهدف الأول TP1\n"
                         f"💰 سعر الدخول: {entry:.6f}\n"
-                        f"🎯 سعر الهدف: {tp1:.6f} (أعلى: {max_price:.6f})\n"
+                        f"🎯 سعر الهدف: {tp1:.6f}\n"
                         f"📈 الربح: +{profit_pct:.2f}%\n"
-                        f"⏳ لا يزال قيد التتبع نحو TP2 ({tp2:.6f})\n"
+                        f"⏳ لا يزال قيد التتبع نحو TP2\n"
                         f"⭐ النقاط: {score}"
                     )
                     self.memory.log_history(trade_id, symbol, 'TP1', entry, tp1, profit_pct, score)
@@ -491,7 +477,7 @@ class SigmaRadar:
                     send_telegram(
                         f"❌ `{trade_id}` *{symbol}* ضرب وقف الخسارة SL\n"
                         f"💰 سعر الدخول: {entry:.6f}\n"
-                        f"🛑 سعر الوقف: {sl:.6f} (أدنى: {min_price:.6f})\n"
+                        f"🛑 سعر الوقف: {sl:.6f}\n"
                         f"📉 الخسارة: {loss_pct:.2f}%\n"
                         f"⭐ النقاط: {score}"
                     )
@@ -503,7 +489,7 @@ class SigmaRadar:
 
     def hunt(self):
         print("\n" + "="*60)
-        print("  📡⚛️ SigmaRadar v2.4")
+        print("  📡⚛️ SigmaRadar v2.5")
         print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*60)
 
@@ -525,20 +511,32 @@ class SigmaRadar:
                 result = future.result()
                 if result:
                     results.append(result)
-                time.sleep(0.05)  # 🔧 تأخير صغير بين النتائج
+                time.sleep(0.05)
 
         results.sort(key=lambda x: -x['score'])
-        top = results[:TOP_N]
+        
+        # ✅ [جديد v2.5] فلترة إضافية بجودة عالية
+        high_quality = [r for r in results if r['score'] >= MIN_SCORE]
+        
+        # إذا أقل من 2، اقبل من (MIN_SCORE - 5) بحذر
+        if len(high_quality) < 2:
+            extra = [r for r in results if MIN_SCORE - 5 <= r['score'] < MIN_SCORE][:2]
+            if extra:
+                print(f"  💡 إضافة {len(extra)} توصية احتياطية (Score 45-49)")
+            high_quality += extra
+        
+        top = high_quality[:TOP_N]
+        
         if not top:
-            print("  📭 لا توجد فرص.")
+            print("  📭 لا توجد فرص بجودة كافية.")
             return
 
-        print(f"  ✅ تم العثور على {len(top)} فرصة!")
+        print(f"  ✅ تم العثور على {len(top)} فرصة (من أصل {len(results)} مرشحة)!")
 
         msg = f"📡⚛️ *توصيات SigmaRadar الكمّية* — {datetime.now().strftime('%H:%M')}\n"
         msg += f"{'─'*30}\n"
         msg += f"السوق: {regime} | BTC: {btc_change:+.2f}%\n"
-        msg += f"أفضل {len(top)} فرص تم رصدها\n"
+        msg += f"أفضل {len(top)} فرص (Score ≥ {MIN_SCORE})\n"
         msg += f"{'─'*30}\n\n"
 
         for i, s in enumerate(top, 1):
@@ -556,14 +554,14 @@ class SigmaRadar:
             msg += f"{'─'*30}\n\n"
 
         send_telegram(msg)
-        print("  ✅ تم إرسال التوصيات إلى تليجرام.")
+        print("  ✅ تم إرسال التوصيات.")
 
-# ═══════════════ نقاط النهاية ═══════════════
+# ═══════════════ Flask ═══════════════
 def run_hunt_background():
     global is_scanning
     with _scan_lock:
         if is_scanning:
-            print("⏳ الفحص قيد التشغيل بالفعل")
+            print("⏳ الفحص قيد التشغيل")
             return
         is_scanning = True
 
@@ -573,7 +571,7 @@ def run_hunt_background():
             radar = SigmaRadar()
             radar.hunt()
         except Exception as e:
-            print(f"❌ خطأ في الخلفية: {e}")
+            print(f"❌ خطأ: {e}")
         finally:
             with _scan_lock:
                 is_scanning = False
@@ -584,7 +582,7 @@ def run_hunt_background():
 
 @app.route('/')
 def home():
-    return "📡⚛️ SigmaRadar v2.4 يعمل!", 200
+    return "📡⚛️ SigmaRadar v2.5 يعمل!", 200
 
 @app.route('/health')
 def health():
@@ -607,7 +605,7 @@ def status():
     if not active:
         return "<h3 style='font-family:sans-serif'>لا توجد صفقات نشطة حالياً</h3>", 200
     html = """
-    <html><head><title>SigmaRadar - Active Trades</title>
+    <html><head><title>SigmaRadar - Active</title>
     <meta http-equiv="refresh" content="30"></head>
     <body style='font-family:sans-serif;padding:20px;background:#111;color:#eee'>
     <h2>📊 الصفقات النشطة</h2>
@@ -640,6 +638,7 @@ def history():
         hist = []
     if not hist:
         return "<h3 style='font-family:sans-serif'>لا يوجد سجل بعد</h3>", 200
+    
     tp1 = sum(1 for h in hist if h['result'] == 'TP1')
     tp2 = sum(1 for h in hist if h['result'] == 'TP2')
     sl = sum(1 for h in hist if h['result'] == 'SL')
@@ -647,6 +646,7 @@ def history():
     wins = tp1 + tp2
     wr = (wins / total * 100) if total > 0 else 0
     net = sum(h['pct'] for h in hist)
+    
     html = f"""
     <html><head><title>SigmaRadar - History</title></head>
     <body style='font-family:sans-serif;padding:20px;background:#111;color:#eee'>
@@ -654,10 +654,58 @@ def history():
     <p>إجمالي: <b>{total}</b> | ✅ TP1: <b>{tp1}</b> | 🚀 TP2: <b>{tp2}</b>
     | ❌ SL: <b>{sl}</b> | 🎯 Win Rate: <b>{wr:.1f}%</b>
     | 📈 صافي: <b>{net:+.2f}%</b></p>
+    """
+    
+    # ✅ [جديد v2.5] تحليل Win Rate حسب Score
+    score_ranges = {
+        '50+': [],
+        '45-49': [],
+        '40-44': [],
+        '< 40': []
+    }
+    for h in hist:
+        s = h.get('score', 0)
+        result = h['result']
+        if s >= 50:
+            score_ranges['50+'].append(result)
+        elif s >= 45:
+            score_ranges['45-49'].append(result)
+        elif s >= 40:
+            score_ranges['40-44'].append(result)
+        else:
+            score_ranges['< 40'].append(result)
+    
+    html += """
+    <h2 style='margin-top:30px'>📊 Win Rate حسب Score</h2>
+    <table border='1' cellpadding='8' style='border-collapse:collapse;width:100%'>
+    <tr style='background:#222'>
+      <th>Score Range</th><th>إجمالي</th><th>✅ ربح</th><th>❌ خسارة</th><th>🎯 Win Rate</th>
+    </tr>
+    """
+    for range_name, results_list in score_ranges.items():
+        if not results_list:
+            continue
+        total_r = len(results_list)
+        wins_r = sum(1 for r in results_list if r in ('TP1', 'TP2'))
+        losses_r = total_r - wins_r
+        wr_r = (wins_r / total_r * 100) if total_r > 0 else 0
+        color = '#2a5' if wr_r >= 60 else '#a33' if wr_r < 40 else '#aa3'
+        html += (
+            f"<tr style='background:{color}22'>"
+            f"<td><b>{range_name}</b></td>"
+            f"<td>{total_r}</td>"
+            f"<td>{wins_r}</td>"
+            f"<td>{losses_r}</td>"
+            f"<td><b>{wr_r:.1f}%</b></td></tr>"
+        )
+    html += "</table>"
+    
+    html += """
+    <h2 style='margin-top:30px'>📋 السجل الكامل</h2>
     <table border='1' cellpadding='8' style='border-collapse:collapse;width:100%'>
     <tr style='background:#222'>
       <th>ID</th><th>العملة</th><th>النتيجة</th><th>الدخول</th>
-      <th>الخروج</th><th>%</th><th>النقاط</th><th>التاريخ</th>
+      <th>الخروج</th><th>%</th><th>Score</th><th>التاريخ</th>
     </tr>
     """
     for h in reversed(hist[-200:]):
