@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-📡⚛️ SigmaRadar v2.5.1 – تتبع ذكي + إصلاح Bug الحفظ
+📡⚛️ SigmaRadar v2.6.0 – Shadow Tracking Edition
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-👤 تصميم وتطوير: المالك
 📅 تاريخ الإنشاء: 2026-09-16
-🔄 آخر تحديث: 2026-09-23
-"عاش الفوهرر والمنطومه " 
+🔄 آخر تحديث: 2026-09-24
 🔒 جميع الحقوق محفوظة © 2026
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━
+"  عاش الفوهرر والمنظومه " 
+ " NAZI "
+━━━━━━━━━━━━━━━━━━━
 
-التحديثات في v2.5.1:
-1. ✅ إصلاح Bug: 174 صفقة تُحفظ بينما 4 فقط تُرسل
-2. ✅ نقل save_active بعد الفلترة النهائية
-3. ✅ حفظ TOP_N فقط (4 صفقات)
-4. ✅ تحسين Rate Limit (عمال: 3 → 2)
-5. ✅ زيادة التأخير لتجنب 429
+التحديثات في v2.6.0:
+1. ✅ Shadow Tracking — تتبع كل مرشحة (≥30 نقطة) مقبولة أو مرفوضة
+2. ✅ إصلاح Bug StochRSI (NaN في البداية)
+3. ✅ تسجيل MFE/MAE لكل مرشحة
+4. ✅ تسجيل نتيجة كل مرشحة (TP1/TP2/SL/EXPIRED)
+5. ✅ ملف sigma_candidates.json منفصل للتحليل
+6. ✅ الحفاظ على السلوك الأصلي للنظام (إرسال 4 فقط)
 """
 
 import ccxt
@@ -42,14 +44,19 @@ MAX_SL_PCT = 8.0
 MAX_RSI_ENTRY = 72.0
 MAX_STOCH_ENTRY = 98.0
 
-# 🔧 Rate Limit (مُحسّن v2.5.1)
-MAX_WORKERS = 2           # من 3 إلى 2
-DELAY_MIN = 0.15          # من 0.1
-DELAY_MAX = 0.40          # من 0.3
+# 🔧 Rate Limit
+MAX_WORKERS = 2
+DELAY_MIN = 0.15
+DELAY_MAX = 0.40
 MAX_RETRIES = 3
 
 # 🧊 الحظر
 BLACKLIST_DAYS = 7
+
+# 🆕 v2.6.0 Shadow Tracking
+CANDIDATES_FILE = "sigma_candidates.json"
+CANDIDATE_MIN_SCORE = 30
+CANDIDATE_MAX_AGE_H = 48
 
 BLACKLIST_FILE = "sigma_blacklist.json"
 ACTIVE_FILE = "sigma_active.json"
@@ -94,11 +101,13 @@ def calc_atr(high, low, close, period=14):
     return atr
 
 def calc_stoch_rsi(close, period=14):
+    """✅ v2.6.0: إصلاح NaN — يُرجع 50 بدل NaN"""
     rsi = calc_rsi(close, period)
-    min_rsi = rsi.rolling(window=period).min()
-    max_rsi = rsi.rolling(window=period).max()
-    stoch = 100 * (rsi - min_rsi) / (max_rsi - min_rsi)
-    return stoch
+    min_rsi = rsi.rolling(window=period, min_periods=period).min()
+    max_rsi = rsi.rolling(window=period, min_periods=period).max()
+    denom = (max_rsi - min_rsi).replace(0, np.nan)
+    stoch = 100 * (rsi - min_rsi) / denom
+    return stoch.fillna(50)
 
 def calc_cmf(df, period=20):
     range_hl = (df['high'] - df['low']).replace(0, np.nan)
@@ -119,6 +128,7 @@ class SmartMemory:
         self._active_lock = threading.Lock()
         self._history_lock = threading.Lock()
         self._blacklist_lock = threading.Lock()
+        self._candidates_lock = threading.Lock()
         self.blacklist = self._load(blacklist_file)
         self.active = self._load(active_file)
         self.counter = self._load(self.counter_file) or {"n": 0}
@@ -212,6 +222,84 @@ class SmartMemory:
             except Exception as e:
                 print(f"⚠️ history save: {e}")
 
+    # ═══════════════ v2.6.0 Shadow Tracking ═══════════════
+    def save_candidate(self, data: dict, accepted: bool, reject_reason: str = None):
+        """يسجّل مرشحة (مقبولة أو مرفوضة) للتحليل لاحقاً"""
+        with self._candidates_lock:
+            try:
+                try:
+                    with open(CANDIDATES_FILE, 'r') as f:
+                        candidates = json.load(f)
+                except:
+                    candidates = {}
+
+                symbol = data['symbol']
+                candidates[symbol] = {
+                    'symbol': symbol,
+                    'entry_time': datetime.now().isoformat(),
+                    'regime': data.get('regime', 'UNKNOWN'),
+                    'accepted': accepted,
+                    'reject_reason': reject_reason,
+                    'score': data['score'],
+                    'entry': data['price'],
+                    'tp1': data['tp1'],
+                    'tp2': data['tp2'],
+                    'sl': data['sl'],
+                    'tp1_pct': data['tp1_pct'],
+                    'tp2_pct': data['tp2_pct'],
+                    'sl_pct': data['sl_pct'],
+                    'rr': data['rr'],
+                    'rsi': data['rsi'],
+                    'stoch_k': data['stoch_k'],
+                    'adx': data['adx'],
+                    'cmf_1h': data['cmf_1h'],
+                    'alpha': data['alpha'],
+                    'vwap_dev': data['vwap_dev'],
+                    'change_24h': data['change_24h'],
+                    'volume_24h': data['volume_24h'],
+                    'drawdown': data['drawdown']['drawdown'],
+                    'zone': data['drawdown']['zone'],
+                    'signals': data['signals'],
+                    'result': 'pending',
+                    'exit_price': None,
+                    'pct': None,
+                    'duration_h': None,
+                    'mfe_pct': None,
+                    'mae_pct': None,
+                }
+                with open(CANDIDATES_FILE, 'w') as f:
+                    json.dump(candidates, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                print(f"⚠️ save_candidate: {e}")
+
+    def get_candidates(self):
+        with self._candidates_lock:
+            try:
+                with open(CANDIDATES_FILE, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+
+    def update_candidate_result(self, symbol, result, exit_price, pct,
+                                 duration_h, mfe, mae):
+        with self._candidates_lock:
+            try:
+                with open(CANDIDATES_FILE, 'r') as f:
+                    candidates = json.load(f)
+                if symbol in candidates:
+                    candidates[symbol].update({
+                        'result': result,
+                        'exit_price': exit_price,
+                        'pct': round(pct, 2),
+                        'duration_h': duration_h,
+                        'mfe_pct': round(mfe, 2) if mfe is not None else None,
+                        'mae_pct': round(mae, 2) if mae is not None else None,
+                    })
+                    with open(CANDIDATES_FILE, 'w') as f:
+                        json.dump(candidates, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                print(f"⚠️ update_candidate_result: {e}")
+
 # ═══════════════ تليجرام ═══════════════
 def send_telegram(message: str):
     try:
@@ -282,7 +370,7 @@ class SigmaRadar:
             return []
 
     def analyze(self, symbol: str, regime: str):
-        """✅ [v2.5.1] تحليل فقط — بدون حفظ في active"""
+        """✅ v2.6.0: يُرجع كل المؤشرات + accepted + reject_reason"""
         try:
             time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
             print(f"    🔍 تحليل {symbol}...", end=' ')
@@ -309,6 +397,7 @@ class SigmaRadar:
                 cmf_1h = 0.0
             name = symbol.split('/')[0]
 
+            # الحظر والنشط = لا نسجّل أبداً (سنتجاهلها)
             if self.memory.is_blocked(name, cmf_1h):
                 print("⛔ محظور")
                 return None
@@ -328,14 +417,6 @@ class SigmaRadar:
             adx = df['ADX'].iloc[-1] if not pd.isna(df['ADX'].iloc[-1]) else 0
             atr = df['ATR'].iloc[-1] if not pd.isna(df['ATR'].iloc[-1]) else price * 0.02
             atr_pct = (atr / price) * 100 if price > 0 else 2.0
-
-            if regime in ("BULL", "NEUTRAL"):
-                if rsi >= MAX_RSI_ENTRY:
-                    print(f"❌ RSI متطرف ({rsi:.1f})")
-                    return None
-                if stoch_k >= MAX_STOCH_ENTRY:
-                    print(f"❌ StochRSI متطرف ({stoch_k:.1f})")
-                    return None
 
             ath = df_daily['high'].max() if not df_daily.empty else price
             dd = ((ath - price) / ath) * 100 if ath > 0 else 0
@@ -361,6 +442,7 @@ class SigmaRadar:
             else:
                 vwap_dev = 0
 
+            # ═══════ نظام النقاط (نفسه القديم — لم نغير شيئاً) ═══════
             score = 0
             signals = []
             if regime == "BULL":
@@ -379,25 +461,36 @@ class SigmaRadar:
             if adx > 25: score += 10; signals.append(f"ADX قوي {adx:.1f}")
             if atr_pct > 3: score += 5
 
-            if score < MIN_SCORE:
-                print(f"❌ نقاط منخفضة ({score})")
-                return None
-
+            # ═══════ حساب الأهداف ═══════
             sl_pct = max(2.0, min(MAX_SL_PCT, atr_pct * 1.5))
             tp1_pct = max(3.0, min(25.0, atr_pct * 2.0))
             tp2_pct = tp1_pct * 1.8
-
             tp1 = price * (1 + tp1_pct/100)
             tp2 = price * (1 + tp2_pct/100)
             sl = price * (1 - sl_pct/100)
-
             rr = (tp2_pct / sl_pct) if sl_pct > 0 else 0
-            if rr < MIN_RR:
-                print(f"❌ R/R منخفض ({rr:.1f})")
-                return None
 
-            # ✅ [v2.5.1] لا نحفظ في active هنا — سيُحفظ فقط المقبولون نهائياً
-            print(f"✅ نقاط {score} (مرشح)")
+            # ═══════ v2.6.0: فحص القبول (لكن لا نُرجع None) ═══════
+            reject_reason = None
+
+            if regime in ("BULL", "NEUTRAL"):
+                if rsi >= MAX_RSI_ENTRY:
+                    reject_reason = f"RSI متطرف ({rsi:.1f})"
+                elif stoch_k >= MAX_STOCH_ENTRY:
+                    reject_reason = f"Stoch متطرف ({stoch_k:.1f})"
+
+            if reject_reason is None:
+                if score < MIN_SCORE:
+                    reject_reason = f"نقاط منخفضة ({score})"
+                elif rr < MIN_RR:
+                    reject_reason = f"R/R منخفض ({rr:.1f})"
+
+            accepted = reject_reason is None
+
+            if accepted:
+                print(f"✅ مقبول ({score})")
+            else:
+                print(f"❌ {reject_reason}")
 
             return {
                 'symbol': name, 'score': score, 'price': price,
@@ -408,7 +501,10 @@ class SigmaRadar:
                 'tp1': tp1, 'tp2': tp2, 'sl': sl,
                 'tp1_pct': round(tp1_pct,1), 'tp2_pct': round(tp2_pct,1),
                 'sl_pct': round(sl_pct,1), 'rr': round(rr,1),
-                'signals': signals[:4]
+                'signals': signals[:4],
+                'regime': regime,
+                'accepted': accepted,
+                'reject_reason': reject_reason,
             }
         except Exception as e:
             print(f"⚠️ خطأ في {symbol}: {e}")
@@ -422,11 +518,20 @@ class SigmaRadar:
             if status == 'closed':
                 continue
             try:
-                ohlcv = self._safe_fetch(self.exchange.fetch_ohlcv, f"{symbol}/USDT", timeframe='1h', limit=6)
+                ohlcv = self._safe_fetch(self.exchange.fetch_ohlcv, f"{symbol}/USDT", timeframe='1h', limit=200)
                 if not ohlcv:
                     continue
-                highs = [c[2] for c in ohlcv]
-                lows = [c[3] for c in ohlcv]
+
+                entry_ts = datetime.fromisoformat(data['entry_time'])
+                age_h = (datetime.now() - entry_ts).total_seconds() / 3600
+                entry_ms = int(entry_ts.timestamp() * 1000)
+
+                filtered = [o for o in ohlcv if o[0] >= entry_ms - 3600_000]
+                if not filtered:
+                    filtered = ohlcv[-6:]
+
+                highs = [c[2] for c in filtered]
+                lows = [c[3] for c in filtered]
                 max_price = max(highs)
                 min_price = min(lows)
 
@@ -478,13 +583,117 @@ class SigmaRadar:
             except Exception as e:
                 print(f"⚠️ خطأ في تتبع {symbol}: {e}")
 
+    def track_candidates(self):
+        """🆕 v2.6.0: تتبع كل المرشحات (المقبولة والمرفوضة)"""
+        print("  🔍 تتبع المرشحات (Shadow Tracking)...")
+        candidates = self.memory.get_candidates()
+        pending = {s: c for s, c in candidates.items() if c.get('result') == 'pending'}
+
+        if not pending:
+            print("    📭 لا مرشحات معلّقة")
+            return
+
+        print(f"    📊 متابعة {len(pending)} مرشحة...")
+        updated = 0
+
+        for symbol, c in list(pending.items()):
+            try:
+                ohlcv = self._safe_fetch(
+                    self.exchange.fetch_ohlcv, f"{symbol}/USDT",
+                    timeframe='1h', limit=200
+                )
+                if not ohlcv:
+                    continue
+
+                entry_ts = datetime.fromisoformat(c['entry_time'])
+                age_h = (datetime.now() - entry_ts).total_seconds() / 3600
+                entry_ms = int(entry_ts.timestamp() * 1000)
+
+                filtered = [o for o in ohlcv if o[0] >= entry_ms - 3600_000]
+                if not filtered:
+                    continue
+
+                # ═══ انتهى العمر → EXPIRED ═══
+                if age_h > CANDIDATE_MAX_AGE_H:
+                    last = ohlcv[-1][4]
+                    pct = ((last - c['entry']) / c['entry']) * 100
+                    highs = [o[2] for o in filtered]
+                    lows = [o[3] for o in filtered]
+                    mfe = ((max(highs) - c['entry']) / c['entry']) * 100 if highs else 0
+                    mae = ((min(lows) - c['entry']) / c['entry']) * 100 if lows else 0
+                    self.memory.update_candidate_result(
+                        symbol, 'EXPIRED', last, pct, round(age_h, 1), mfe, mae
+                    )
+                    updated += 1
+                    continue
+
+                # ═══ المرور على الشموع بالترتيب ═══
+                result = None
+                exit_price = None
+                pct = 0
+                mfe_max = -999
+                mae_min = 999
+
+                for o in filtered:
+                    high, low = o[2], o[3]
+                    mfe_max = max(mfe_max, ((high - c['entry']) / c['entry']) * 100)
+                    mae_min = min(mae_min, ((low - c['entry']) / c['entry']) * 100)
+
+                    # SL أولاً (متحفظ)
+                    if low <= c['sl']:
+                        result = 'SL'
+                        exit_price = c['sl']
+                        pct = ((c['sl'] - c['entry']) / c['entry']) * 100
+                        break
+                    if high >= c['tp2']:
+                        result = 'TP2'
+                        exit_price = c['tp2']
+                        pct = ((c['tp2'] - c['entry']) / c['entry']) * 100
+                        break
+                    if high >= c['tp1']:
+                        result = 'TP1'
+                        exit_price = c['tp1']
+                        pct = ((c['tp1'] - c['entry']) / c['entry']) * 100
+                        break
+
+                if result:
+                    # وقت الإغلاق
+                    duration_h = age_h
+                    self.memory.update_candidate_result(
+                        symbol, result, exit_price, pct,
+                        round(duration_h, 1), mfe_max, mae_min
+                    )
+                    updated += 1
+                else:
+                    # لم تُغلق — نُحدّث MFE/MAE فقط
+                    if mfe_max > -999:
+                        try:
+                            with open(CANDIDATES_FILE, 'r') as f:
+                                all_c = json.load(f)
+                            if symbol in all_c:
+                                all_c[symbol]['mfe_pct'] = round(mfe_max, 2)
+                                all_c[symbol]['mae_pct'] = round(mae_min, 2)
+                                with open(CANDIDATES_FILE, 'w') as f:
+                                    json.dump(all_c, f, indent=2, ensure_ascii=False)
+                        except:
+                            pass
+
+            except Exception as e:
+                print(f"⚠️ خطأ تتبع {symbol}: {e}")
+
+        print(f"    ✅ تم تحديث {updated} مرشحة")
+
     def hunt(self):
         print("\n" + "="*60)
-        print("  📡⚛️ SigmaRadar v2.5.1")
+        print("  📡⚛️ SigmaRadar v2.6.0 – Shadow Tracking")
         print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*60)
 
+        # 1) تتبع الصفقات المقبولة (تليجرام)
         self.track_active_signals()
+
+        # 2) 🆕 تتبع كل المرشحات (تحليل فقط)
+        self.track_candidates()
 
         regime, btc_change = self.fetch_btc()
         print(f"  Market: {regime} | BTC: {btc_change:+.2f}%")
@@ -495,23 +704,35 @@ class SigmaRadar:
             return
 
         print(f"  🔍 تحليل {len(symbols)} عملة (عمال: {MAX_WORKERS})...")
-        results = []
+        all_results = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(self.analyze, sym, regime): sym for sym in symbols}
             for future in as_completed(futures):
                 result = future.result()
                 if result:
-                    results.append(result)
+                    all_results.append(result)
                 time.sleep(0.05)
 
-        results.sort(key=lambda x: -x['score'])
+        # ═══ الفصل بين المقبول والمرفوض ═══
+        accepted_list = [r for r in all_results if r.get('accepted')]
+        rejected_list = [r for r in all_results if not r.get('accepted')]
 
-        # ✅ فلترة إضافية
-        high_quality = [r for r in results if r['score'] >= MIN_SCORE]
+        print(f"  📊 النتائج: {len(accepted_list)} مقبولة | {len(rejected_list)} مرفوضة")
 
-        # إذا أقل من 2، اقبل من (MIN_SCORE - 5) بحذر
+        # ═══ حفظ كل المرشحات (≥ CANDIDATE_MIN_SCORE) للتحليل ═══
+        shadow_saved = 0
+        for r in all_results:
+            if r['score'] >= CANDIDATE_MIN_SCORE:
+                self.memory.save_candidate(r, r['accepted'], r.get('reject_reason'))
+                shadow_saved += 1
+        print(f"  💾 Shadow: سُجّلت {shadow_saved} مرشحة للتحليل")
+
+        # ═══ اختيار TOP_N من المقبولين ═══
+        accepted_list.sort(key=lambda x: -x['score'])
+        high_quality = [r for r in accepted_list if r['score'] >= MIN_SCORE]
+
         if len(high_quality) < 2:
-            extra = [r for r in results if MIN_SCORE - 5 <= r['score'] < MIN_SCORE][:2]
+            extra = [r for r in accepted_list if MIN_SCORE - 5 <= r['score'] < MIN_SCORE][:2]
             if extra:
                 print(f"  💡 إضافة {len(extra)} توصية احتياطية (Score 45-49)")
             high_quality += extra
@@ -522,9 +743,9 @@ class SigmaRadar:
             print("  📭 لا توجد فرص بجودة كافية.")
             return
 
-        print(f"  ✅ تم العثور على {len(top)} فرصة (من أصل {len(results)} مرشحة)!")
+        print(f"  ✅ تم اختيار {len(top)} توصية للإرسال")
 
-        # ✅ [v2.5.1] الحفظ بعد الفلترة النهائية — TOP_N فقط!
+        # ═══ حفظ TOP_N في active ═══
         for s in top:
             s['trade_id'] = self.memory.next_trade_id()
             self.memory.save_active(s['symbol'], {
@@ -547,6 +768,7 @@ class SigmaRadar:
             })
             print(f"  💾 حُفظ {s['symbol']} | {s['trade_id']}")
 
+        # ═══ إرسال تليجرام ═══
         msg = f"📡⚛️ *توصيات SigmaRadar الكمّية* — {datetime.now().strftime('%H:%M')}\n"
         msg += f"{'─'*30}\n"
         msg += f"السوق: {regime} | BTC: {btc_change:+.2f}%\n"
@@ -596,7 +818,7 @@ def run_hunt_background():
 
 @app.route('/')
 def home():
-    return "📡⚛️ SigmaRadar v2.5.1 يعمل!", 200
+    return "📡⚛️ SigmaRadar v2.6.0 – Shadow Tracking يعمل!", 200
 
 @app.route('/health')
 def health():
@@ -643,6 +865,92 @@ def status():
     html += "</table></body></html>"
     return html, 200
 
+@app.route('/candidates')
+def candidates_page():
+    """🆕 v2.6.0: صفحة المرشحات للتحليل"""
+    try:
+        with open(CANDIDATES_FILE, 'r') as f:
+            cands = json.load(f)
+    except:
+        return "<h3>لا يوجد ملف مرشحات بعد</h3>", 200
+
+    if not cands:
+        return "<h3>الملف فارغ</h3>", 200
+
+    # إحصائيات
+    total = len(cands)
+    pending = sum(1 for c in cands.values() if c['result'] == 'pending')
+    closed = total - pending
+
+    accepted_all = [c for c in cands.values() if c['accepted']]
+    rejected_all = [c for c in cands.values() if not c['accepted']]
+
+    def stats(lst):
+        c = [x for x in lst if x['result'] != 'pending']
+        if not c:
+            return 0, 0, 0, 0
+        wins = sum(1 for x in c if x['result'] in ('TP1', 'TP2'))
+        losses = sum(1 for x in c if x['result'] == 'SL')
+        expired = sum(1 for x in c if x['result'] == 'EXPIRED')
+        wr = (wins / len(c) * 100) if c else 0
+        return len(c), wins, losses, wr
+
+    acc_total, acc_wins, acc_loss, acc_wr = stats(accepted_all)
+    rej_total, rej_wins, rej_loss, rej_wr = stats(rejected_all)
+
+    html = f"""
+    <html><head><title>Candidates Analysis</title>
+    <meta http-equiv="refresh" content="60"></head>
+    <body style='font-family:sans-serif;padding:20px;background:#111;color:#eee'>
+    <h2>🧬 تحليل المرشحات (Shadow Tracking)</h2>
+    <p>إجمالي: <b>{total}</b> | معلّقة: <b>{pending}</b> | مغلقة: <b>{closed}</b></p>
+
+    <h3>📊 المقبول vs المرفوض</h3>
+    <table border='1' cellpadding='8' style='border-collapse:collapse;width:100%'>
+    <tr style='background:#222'>
+      <th>الفئة</th><th>مغلقة</th><th>✅ ربح</th><th>❌ خسارة</th><th>🎯 WR</th>
+    </tr>
+    <tr style='background:#2a5a'>
+      <td><b>مقبولة</b></td><td>{acc_total}</td><td>{acc_wins}</td>
+      <td>{acc_loss}</td><td><b>{acc_wr:.1f}%</b></td></tr>
+    <tr style='background:#a3aa'>
+      <td><b>مرفوضة</b></td><td>{rej_total}</td><td>{rej_wins}</td>
+      <td>{rej_loss}</td><td><b>{rej_wr:.1f}%</b></td></tr>
+    </table>
+
+    <h3>📋 كل المرشحات</h3>
+    <table border='1' cellpadding='6' style='border-collapse:collapse;width:100%;font-size:13px'>
+    <tr style='background:#222'>
+      <th>العملة</th><th>Score</th><th>Regime</th><th>Stoch</th><th>RSI</th>
+      <th>CMF</th><th>ADX</th><th>24h%</th><th>مقبولة؟</th><th>النتيجة</th>
+      <th>%</th><th>MFE</th><th>MAE</th><th>مدة</th>
+    </tr>
+    """
+    # ترتيب حسب الوقت (الأحدث أولاً)
+    sorted_c = sorted(cands.values(), key=lambda x: x['entry_time'], reverse=True)
+    for c in sorted_c[:100]:
+        color = '#2a5' if c['result'] in ('TP1','TP2') else '#a33' if c['result'] == 'SL' else '#555'
+        acc_icon = '✅' if c['accepted'] else '❌'
+        html += (
+            f"<tr style='background:{color}22'>"
+            f"<td><b>{c['symbol']}</b></td>"
+            f"<td>{c['score']}</td>"
+            f"<td>{c.get('regime','-')}</td>"
+            f"<td>{c['stoch_k']:.1f}</td>"
+            f"<td>{c['rsi']:.1f}</td>"
+            f"<td>{c['cmf_1h']:.3f}</td>"
+            f"<td>{c['adx']:.1f}</td>"
+            f"<td>{c['change_24h']:+.1f}%</td>"
+            f"<td>{acc_icon}</td>"
+            f"<td><b>{c['result']}</b></td>"
+            f"<td>{c['pct'] if c['pct'] is not None else '-'}</td>"
+            f"<td>{c['mfe_pct'] if c['mfe_pct'] is not None else '-'}</td>"
+            f"<td>{c['mae_pct'] if c['mae_pct'] is not None else '-'}</td>"
+            f"<td>{c['duration_h'] if c['duration_h'] is not None else '-'}</td></tr>"
+        )
+    html += "</table></body></html>"
+    return html, 200
+
 @app.route('/history')
 def history():
     try:
@@ -669,41 +977,6 @@ def history():
     | ❌ SL: <b>{sl}</b> | 🎯 Win Rate: <b>{wr:.1f}%</b>
     | 📈 صافي: <b>{net:+.2f}%</b></p>
     """
-
-    score_ranges = {'50+': [], '45-49': [], '40-44': [], '< 40': []}
-    for h in hist:
-        s = h.get('score', 0)
-        result = h['result']
-        if s >= 50: score_ranges['50+'].append(result)
-        elif s >= 45: score_ranges['45-49'].append(result)
-        elif s >= 40: score_ranges['40-44'].append(result)
-        else: score_ranges['< 40'].append(result)
-
-    html += """
-    <h2 style='margin-top:30px'>📊 Win Rate حسب Score</h2>
-    <table border='1' cellpadding='8' style='border-collapse:collapse;width:100%'>
-    <tr style='background:#222'>
-      <th>Score Range</th><th>إجمالي</th><th>✅ ربح</th><th>❌ خسارة</th><th>🎯 Win Rate</th>
-    </tr>
-    """
-    for range_name, results_list in score_ranges.items():
-        if not results_list:
-            continue
-        total_r = len(results_list)
-        wins_r = sum(1 for r in results_list if r in ('TP1', 'TP2'))
-        losses_r = total_r - wins_r
-        wr_r = (wins_r / total_r * 100) if total_r > 0 else 0
-        color = '#2a5' if wr_r >= 60 else '#a33' if wr_r < 40 else '#aa3'
-        html += (
-            f"<tr style='background:{color}22'>"
-            f"<td><b>{range_name}</b></td>"
-            f"<td>{total_r}</td>"
-            f"<td>{wins_r}</td>"
-            f"<td>{losses_r}</td>"
-            f"<td><b>{wr_r:.1f}%</b></td></tr>"
-        )
-    html += "</table>"
-
     html += """
     <h2 style='margin-top:30px'>📋 السجل الكامل</h2>
     <table border='1' cellpadding='8' style='border-collapse:collapse;width:100%'>
