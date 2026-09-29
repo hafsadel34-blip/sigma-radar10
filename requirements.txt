@@ -1,9 +1,0 @@
-flask
-aiohttp
-ccxt
-pandas
-numpy
-nest-asyncio
-apscheduler
-gunicorn
-python-telegram-bot
