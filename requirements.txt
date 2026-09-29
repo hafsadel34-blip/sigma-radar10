@@ -1,0 +1,20 @@
+# ═══════════════════════════════════
+# ⚛️ SigmaRadar v4.0 — Dependencies
+# ═══════════════════════════════════
+
+# Core
+ccxt>=4.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Web
+flask>=3.0.0
+gunicorn>=21.0.0
+
+# Async / HTTP
+aiohttp>=3.9.0
+requests>=2.31.0
+
+# Utils
+python-dateutil>=2.8.2
+pytz>=2023.3
