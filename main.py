@@ -3,9 +3,9 @@
 """
 ⚛️ SigmaRadar v4.0 — المنطق الكامل
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ملف واحد يحتوي على كل شيء:
 - Config / RegimeDetector / Analyzer / Scorer / Filters
 - Telegram / SignalGenerator / Tracker / run_scan
+- Log تفصيلي لكل عملة (مثل v2.6)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -294,7 +294,7 @@ class Scorer:
             score -= 40
         
         if score < Config.MIN_SCORE:
-            return None, [], [f"❌ نقاط منخفضة ({score})"]
+            return None, [], [f"نقاط منخفضة ({score})"]
         
         if score > Config.MAX_SCORE:
             score = Config.MAX_SCORE
@@ -322,13 +322,13 @@ class Filters:
         if change > 10 and adx > Config.PUMP_ADX_COMBO:
             return False, f"بامب + ADX"
         if dd < Config.MIN_DD:
-            return False, f"قريب ATH"
+            return False, f"قريب ATH (dd {dd:.1f}%)"
         if adx > Config.MAX_ADX:
-            return False, f"ADX متطرف"
+            return False, f"ADX متطرف {adx:.1f}"
         if adx < Config.MIN_ADX:
-            return False, f"ADX ضعيف"
+            return False, f"ADX ضعيف {adx:.1f}"
         if rsi > Config.MAX_RSI:
-            return False, f"RSI متطرف"
+            return False, f"RSI متطرف {rsi:.1f}"
         
         return True, ""
 
@@ -392,7 +392,6 @@ class Telegram:
         await self.send(msg)
     
     def _format(self, s, idx):
-        # نعرض الرمز مع /USDT للوضوح
         display = f"{s['symbol']}/USDT"
         
         msg = f"<b>{idx}. {display}</b>  ⭐ {s['score']}\n"
@@ -453,17 +452,16 @@ class SignalGenerator:
         candidates = []
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {executor.submit(self._process, sym, regime): sym for sym in symbols}
-            for i, f in enumerate(as_completed(futures), 1):
+            for f in as_completed(futures):
                 try:
                     r = f.result()
                     if r:
                         candidates.append(r)
                 except:
                     pass
-                if i % 100 == 0:
-                    print(f"  ... {i}/{len(symbols)}")
         
-        print(f"\n✅ مرشحات: {len(candidates)}")
+        print(f"\n{'─'*60}")
+        print(f"✅ مرشحات: {len(candidates)}")
         
         accepted = [c for c in candidates if c['accepted']]
         rejected = [c for c in candidates if not c['accepted']]
@@ -472,7 +470,7 @@ class SignalGenerator:
         accepted.sort(key=lambda x: -x['score'])
         final = accepted[:Config.MAX_SIGNALS]
         
-        # ✅ حفظ الإشارات في trades
+        # حفظ الإشارات في trades
         for sig in final:
             storage.save_trade({
                 'symbol': sig['symbol'],
@@ -539,42 +537,71 @@ class SignalGenerator:
         return symbols[:Config.MAX_CANDIDATES]
     
     def _process(self, symbol, regime):
+        """معالجة عملة واحدة — مع Log تفصيلي"""
+        base = symbol.split('/')[0]
+        
         try:
-            base = symbol.split('/')[0]
+            # 1. Blacklist
             if storage.is_blacklisted(base):
+                print(f"  🔍 {base:<10} ⛔ Blacklist")
                 return None
             
+            # 2. تحليل
             analysis = self.analyzer.analyze(symbol)
             if not analysis:
+                print(f"  🔍 {base:<10} ❌ بيانات غير كافية")
                 return None
             
-            # ✅ نضيف symbol أولاً حتى يقدر الفلتر يستخدمه
+            # 3. إضافة symbol
             analysis['symbol'] = base
             
-            passed, reason = self.filters.check(analysis)
+            # 4. الفلاتر
+            passed, filter_reason = self.filters.check(analysis)
+            
+            # 5. النقاط
             score, reasons, warnings = self.scorer.score(analysis)
             
-            accepted = passed and score is not None
+            # 6. Logging تفصيلي
+            if not passed:
+                print(f"  🔍 {base:<10} ❌ {filter_reason}")
+                return self._build_candidate(
+                    base, regime, analysis, 0, False, filter_reason, [], []
+                )
             
-            # ✅ نبني الـ candidate — symbol في النهاية لتجنب الاستبدال
-            candidate = {
-                'regime': regime,
-                'score': score or 0,
-                'accepted': accepted,
-                'reject_reason': reason if not passed else None,
-                'reasons': reasons,
-                'warnings': warnings,
-                **{k: v for k, v in analysis.items() if k != 'symbol'},
-                'symbol': base,  # ← الأخير — مضمون
-            }
+            if score is None:
+                reject_reason = warnings[0] if warnings else "نقاط منخفضة"
+                print(f"  🔍 {base:<10} ❌ {reject_reason}")
+                return self._build_candidate(
+                    base, regime, analysis, 0, False, reject_reason, [], warnings
+                )
             
-            if accepted:
-                candidate.update(self._calc_targets(analysis))
-            
-            return candidate
+            print(f"  🔍 {base:<10} ✅ مقبول ({score})")
+            return self._build_candidate(
+                base, regime, analysis, score, True, None, reasons, warnings
+            )
+        
         except Exception as e:
-            print(f"⚠️ _process {symbol}: {e}")
+            print(f"  🔍 {base:<10} ⚠️ خطأ: {e}")
             return None
+    
+    def _build_candidate(self, base, regime, analysis, score,
+                          accepted, reject_reason, reasons, warnings):
+        """بناء الـ candidate بشكل موحد"""
+        candidate = {
+            'regime': regime,
+            'score': score,
+            'accepted': accepted,
+            'reject_reason': reject_reason,
+            'reasons': reasons,
+            'warnings': warnings,
+            **{k: v for k, v in analysis.items() if k != 'symbol'},
+            'symbol': base,
+        }
+        
+        if accepted:
+            candidate.update(self._calc_targets(analysis))
+        
+        return candidate
     
     def _calc_targets(self, a):
         entry = a['price']
