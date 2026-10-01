@@ -3,15 +3,18 @@
 """
 ⚛️ SigmaRadar v4.0 — المنطق الكامل
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Config / RegimeDetector / Analyzer / Scorer / Filters
-- Telegram / SignalGenerator / Tracker / run_scan
-- Log تفصيلي لكل عملة (مثل v2.6)
+v4.0.2 — إصلاح Rate Limit:
+- max_workers: 4 → 2
+- تأخير عشوائي بين الطلبات
+- retry لمحاولتين لكل عملة
+- Log تفصيلي
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import os
 import asyncio
 import time
+import random
 import ccxt
 import numpy as np
 import pandas as pd
@@ -53,6 +56,12 @@ class Config:
     MIN_VOLUME = 100_000
     PAPER_TRADING = True
     SCAN_COOLDOWN = 300
+    
+    # 🆕 Rate Limit
+    MAX_WORKERS = 2          # من 4 → 2
+    DELAY_MIN = 0.05         # ثانية
+    DELAY_MAX = 0.15         # ثانية
+    RETRY_ATTEMPTS = 2       # محاولات لكل عملة
 
 
 # ═══════════════════════════════════
@@ -135,6 +144,9 @@ class Analyzer:
     
     def analyze(self, symbol):
         try:
+            # 🆕 تأخير عشوائي لمنع Rate Limit
+            time.sleep(random.uniform(Config.DELAY_MIN, Config.DELAY_MAX))
+            
             o15 = self.exchange.fetch_ohlcv(symbol, '15m', limit=100)
             o1h = self.exchange.fetch_ohlcv(symbol, '1h', limit=200)
             o4h = self.exchange.fetch_ohlcv(symbol, '4h', limit=100)
@@ -179,7 +191,7 @@ class Analyzer:
                 'rsi_4h': ind4h['rsi'],
                 'alignment_score': alignment,
             }
-        except:
+        except Exception as e:
             return None
     
     def _indicators(self, df):
@@ -450,7 +462,7 @@ class SignalGenerator:
         print(f"📡 فحص {len(symbols)} عملة...\n")
         
         candidates = []
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
             futures = {executor.submit(self._process, sym, regime): sym for sym in symbols}
             for f in as_completed(futures):
                 try:
@@ -537,7 +549,7 @@ class SignalGenerator:
         return symbols[:Config.MAX_CANDIDATES]
     
     def _process(self, symbol, regime):
-        """معالجة عملة واحدة — مع Log تفصيلي"""
+        """معالجة عملة واحدة — مع retry لمنع Rate Limit"""
         base = symbol.split('/')[0]
         
         try:
@@ -546,8 +558,15 @@ class SignalGenerator:
                 print(f"  🔍 {base:<10} ⛔ Blacklist")
                 return None
             
-            # 2. تحليل
-            analysis = self.analyzer.analyze(symbol)
+            # 2. تحليل مع retry
+            analysis = None
+            for attempt in range(Config.RETRY_ATTEMPTS):
+                analysis = self.analyzer.analyze(symbol)
+                if analysis:
+                    break
+                if attempt < Config.RETRY_ATTEMPTS - 1:
+                    time.sleep(0.5)  # انتظار قبل retry
+            
             if not analysis:
                 print(f"  🔍 {base:<10} ❌ بيانات غير كافية")
                 return None
@@ -767,7 +786,7 @@ async def run_scan(force: bool = False):
     _last_scan_time = time.time()
     
     print(f"\n{'='*60}")
-    print(f"  ⚛️ SigmaRadar v4.0")
+    print(f"  ⚛️ SigmaRadar v4.0.2")
     print(f"  🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
     
