@@ -1,23 +1,47 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ⚛️ SigmaRadar v4.0 — التخزين الدائم
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SQLite — لا يضيع مع Render.
-كل صفقة، كل مرشحة، كل blacklist في مكان دائم.
+مستقل تماماً — لا يعتمد على ملفات أخرى.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import sqlite3
 import json
 import os
+import threading
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-import threading
 
-from config import DB_PATH, DATA_DIR, PERMANENT_BLACKLIST
 
+# ═══════════════════════════════════
+# 📁 الإعدادات المحلية
+# ═══════════════════════════════════
+
+DATA_DIR = os.environ.get("DATA_DIR", "./data")
+DB_PATH = os.path.join(DATA_DIR, "sigma_v4.db")
+
+# Hard Blacklist — دائم (مبني على 111 صفقة من v2.6)
+PERMANENT_BLACKLIST = {
+    "MHA": "خسرت 3 مرات",
+    "LONGXIA": "خسرت 4 مرات",
+    "TRIA": "خسرت 3 مرات",
+    "STAR": "90 نقطة → خسارة",
+    "SEI": "90 نقطة → خسارة",
+    "GRT": "90 نقطة → خسارة",
+    "AXL": "90 نقطة → خسارة",
+}
+
+
+# ═══════════════════════════════════
+# 💾 Storage Class
+# ═══════════════════════════════════
 
 class Storage:
-    """التخزين الدائم — يستخدم SQLite"""
+    """التخزين الدائم — SQLite"""
     
     _instance = None
     _lock = threading.Lock()
@@ -171,7 +195,6 @@ class Storage:
     def close_trade(self, trade_id: int, result: str, exit_price: float, pnl_pct: float):
         """إغلاق صفقة"""
         with self._lock:
-            # جلب وقت الدخول لحساب المدة
             row = self.conn.execute(
                 "SELECT entry_time FROM trades WHERE id = ?", (trade_id,)
             ).fetchone()
@@ -244,7 +267,7 @@ class Storage:
         """).fetchall()
         return [dict(r) for r in rows]
     
-    def update_candidate_result(self, candidate_id: int, result: str, 
+    def update_candidate_result(self, candidate_id: int, result: str,
                                  exit_price: float, pnl_pct: float):
         """تحديث نتيجة مرشحة"""
         with self._lock:
@@ -292,7 +315,7 @@ class Storage:
     # Scan Logs
     # ═══════════════════════════════════
     
-    def log_scan(self, regime: str, btc_change: float, 
+    def log_scan(self, regime: str, btc_change: float,
                  candidates: int, accepted: int, duration: float):
         """تسجيل فحص"""
         with self._lock:
@@ -312,13 +335,12 @@ class Storage:
     
     def get_stats(self) -> Dict:
         """إحصاءات شاملة"""
-        # إجمالي
         total = self.conn.execute(
             "SELECT COUNT(*) as c FROM trades WHERE result IS NOT NULL"
         ).fetchone()['c']
         
         if total == 0:
-            return {"total": 0}
+            return {"total": 0, "wins": 0, "losses": 0, "wr": 0, "by_regime": {}}
         
         wins = self.conn.execute("""
             SELECT COUNT(*) as c FROM trades 
@@ -329,7 +351,6 @@ class Storage:
             SELECT COUNT(*) as c FROM trades WHERE result = 'SL'
         """).fetchone()['c']
         
-        # حسب Regime
         by_regime = {}
         for regime in ['NEUTRAL', 'BULL', 'BEAR', 'STRONG_BEAR', 'STRONG_BULL']:
             r = self.conn.execute("""
@@ -360,5 +381,8 @@ class Storage:
         self.conn.close()
 
 
+# ═══════════════════════════════════
 # Singleton
+# ═══════════════════════════════════
+
 storage = Storage()
