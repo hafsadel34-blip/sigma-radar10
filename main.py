@@ -4,15 +4,8 @@
 ⚛️ SigmaRadar v4.0 — المنطق الكامل
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ملف واحد يحتوي على كل شيء:
-- Config
-- RegimeDetector
-- Analyzer
-- Scorer
-- Filters
-- Telegram
-- SignalGenerator
-- Tracker
-- run_scan
+- Config / RegimeDetector / Analyzer / Scorer / Filters
+- Telegram / SignalGenerator / Tracker / run_scan
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -60,16 +53,6 @@ class Config:
     MIN_VOLUME = 100_000
     PAPER_TRADING = True
     SCAN_COOLDOWN = 300
-    
-    PERMANENT_BLACKLIST = {
-        "MHA": "خسرت 3 مرات",
-        "LONGXIA": "خسرت 4 مرات",
-        "TRIA": "خسرت 3 مرات",
-        "STAR": "90 نقطة → خسارة",
-        "SEI": "90 نقطة → خسارة",
-        "GRT": "90 نقطة → خسارة",
-        "AXL": "90 نقطة → خسارة",
-    }
 
 
 # ═══════════════════════════════════
@@ -185,7 +168,6 @@ class Analyzer:
             alignment = self._alignment(ind15, ind1h, ind4h)
             
             return {
-                'symbol': symbol,
                 'price': price,
                 'change_24h': change,
                 'volume_24h': volume,
@@ -207,7 +189,6 @@ class Analyzer:
             
             close, high, low, volume = df['c'], df['h'], df['l'], df['v']
             
-            # RSI
             delta = close.diff()
             gain = delta.where(delta > 0, 0).rolling(14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -215,7 +196,6 @@ class Analyzer:
             rsi_val = (100 - (100 / (1 + rs))).iloc[-1]
             rsi = float(rsi_val) if not pd.isna(rsi_val) else 50.0
             
-            # ADX
             tr1 = high - low
             tr2 = abs(high - close.shift())
             tr3 = abs(low - close.shift())
@@ -233,7 +213,6 @@ class Analyzer:
             adx_val = dx.rolling(14).mean().iloc[-1]
             adx = float(adx_val) if not pd.isna(adx_val) else 0.0
             
-            # CMF
             rng = (high - low).replace(0, np.nan)
             mfm = ((close - low) - (high - close)) / rng
             mfm = mfm.fillna(0)
@@ -241,7 +220,6 @@ class Analyzer:
             cmf_val = (mfv.rolling(20).sum() / volume.rolling(20).sum()).iloc[-1]
             cmf = float(cmf_val) if not pd.isna(cmf_val) else 0.0
             
-            # ATR %
             atr_val = atr.iloc[-1]
             atr_pct = (atr_val / close.iloc[-1]) * 100 if close.iloc[-1] > 0 else 0
             
@@ -277,7 +255,6 @@ class Scorer:
         adx = coin.get('adx_1h', 0)
         dd = coin.get('drawdown', 0)
         
-        # Kill switches
         if change > Config.MAX_CHANGE_24H:
             return None, [], [f"بامب {change:.1f}%"]
         if dd < Config.MIN_DD:
@@ -287,7 +264,6 @@ class Scorer:
         if rsi > Config.MAX_RSI:
             return None, [], [f"RSI متطرف {rsi:.1f}"]
         
-        # 24h
         if -15 <= change <= -3:
             score += 40
             reasons.append(f"✅ 24h ذهبي ({change:.1f}%)")
@@ -299,21 +275,18 @@ class Scorer:
             score -= 50
             warnings.append(f"⚠️ شبه بامب ({change:.1f}%)")
         
-        # RSI
         if 15 <= rsi <= 40:
             score += 20
             reasons.append(f"✅ RSI منطقة ({rsi:.1f})")
         elif rsi > 60:
             score -= 20
         
-        # ADX
         if 25 <= adx <= 55:
             score += 15
             reasons.append(f"✅ ADX صحي ({adx:.1f})")
         elif adx > 70:
             score -= 30
         
-        # dd
         if dd > 40:
             score += 10
             reasons.append(f"✅ dd عميق ({dd:.1f}%)")
@@ -419,7 +392,10 @@ class Telegram:
         await self.send(msg)
     
     def _format(self, s, idx):
-        msg = f"<b>{idx}. {s['symbol']}</b>  ⭐ {s['score']}\n"
+        # نعرض الرمز مع /USDT للوضوح
+        display = f"{s['symbol']}/USDT"
+        
+        msg = f"<b>{idx}. {display}</b>  ⭐ {s['score']}\n"
         msg += f"💰 الدخول: <code>{s['entry']:.6f}</code>\n"
         msg += f"🎯 TP1: <code>{s['tp1']:.6f}</code> (+{s['tp1_pct']}%)\n"
         msg += f"🚀 TP2: <code>{s['tp2']:.6f}</code> (+{s['tp2_pct']}%)\n"
@@ -572,27 +548,32 @@ class SignalGenerator:
             if not analysis:
                 return None
             
+            # ✅ نضيف symbol أولاً حتى يقدر الفلتر يستخدمه
+            analysis['symbol'] = base
+            
             passed, reason = self.filters.check(analysis)
             score, reasons, warnings = self.scorer.score(analysis)
             
             accepted = passed and score is not None
             
+            # ✅ نبني الـ candidate — symbol في النهاية لتجنب الاستبدال
             candidate = {
-                'symbol': base,
                 'regime': regime,
                 'score': score or 0,
                 'accepted': accepted,
                 'reject_reason': reason if not passed else None,
                 'reasons': reasons,
                 'warnings': warnings,
-                **analysis,
+                **{k: v for k, v in analysis.items() if k != 'symbol'},
+                'symbol': base,  # ← الأخير — مضمون
             }
             
             if accepted:
                 candidate.update(self._calc_targets(analysis))
             
             return candidate
-        except:
+        except Exception as e:
+            print(f"⚠️ _process {symbol}: {e}")
             return None
     
     def _calc_targets(self, a):
