@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-⚛️ SigmaRadar v4.0.4 — SIG IDs + 4 Signals
+⚛️ SigmaRadar v4.0.5 — Token in Code
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v4.0.4:
-- MAX_SIGNALS = 4 (بدل 8)
+v4.0.5:
+- التوكن مكتوب مباشرة في Config
 - SIG-XXXX في كل الرسائل
-- SIG-XXXX في Log
+- MAX_SIGNALS = 4
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -31,8 +31,9 @@ from storage import storage
 # ═══════════════════════════════════
 
 class Config:
-    TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-    TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+    # ⚠️ التوكن مكتوب مباشرة (المستودع خاص)
+    TELEGRAM_TOKEN = "8892386642:AAFrH8mz-XQjYDnsjY2RkPoJz7oMcbIDTdw"
+    TELEGRAM_CHAT_ID = "6499356593"
     
     BTC_STRONG_BEAR = -3.0
     BTC_BEAR = -1.0
@@ -52,7 +53,7 @@ class Config:
     MIN_ADX = 15.0
     
     MAX_CANDIDATES = 300
-    MAX_SIGNALS = 4              # ← 4 بدل 8
+    MAX_SIGNALS = 4
     MIN_VOLUME = 100_000
     PAPER_TRADING = True
     SCAN_COOLDOWN = 300
@@ -385,7 +386,7 @@ class Telegram:
         if not signals:
             return
         
-        msg = f"⚛️ <b>SigmaRadar v4.0.4</b>\n"
+        msg = f"⚛️ <b>SigmaRadar v4.0.5</b>\n"
         msg += f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
         msg += f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         msg += f"📊 <b>السوق:</b> {regime}\n"
@@ -481,7 +482,7 @@ class SignalGenerator:
         accepted.sort(key=lambda x: -x['score'])
         final = accepted[:Config.MAX_SIGNALS]
         
-        # ✅ حفظ الإشارات مع SIG ID
+        # حفظ الإشارات مع SIG ID
         for sig in final:
             trade_id = storage.save_trade({
                 'symbol': sig['symbol'],
@@ -711,7 +712,7 @@ class Tracker:
         icon = icons.get(result, '📊')
         trade_id = trade.get('id', 0)
         
-        msg = f"{icon} <b>SigmaRadar v4.0.4</b>\n"
+        msg = f"{icon} <b>SigmaRadar v4.0.5</b>\n"
         msg += f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         msg += f"🆔 <b>SIG-{trade_id:04d}</b>\n"
         msg += f"<b>{trade['symbol']}/USDT</b> — {result}\n\n"
@@ -809,7 +810,7 @@ async def run_scan(force: bool = False):
     global _last_scan_time
     
     print(f"\n{'='*60}")
-    print(f"  ⚛️ SigmaRadar v4.0.4")
+    print(f"  ⚛️ SigmaRadar v4.0.5")
     print(f"  🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
     
