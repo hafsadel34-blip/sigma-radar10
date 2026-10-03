@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-⚛️ SigmaRadar v4.0.3 — إشعارات التتبع
+⚛️ SigmaRadar v4.0.4 — SIG IDs + 4 Signals
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v4.0.3 — الإصلاحات:
-- Tracker يُرسل إشعارات تيليجرام
-- Tracker يعمل بشكل مستقل عن Cooldown
-- Log تفصيلي لكل صفقة مغلقة
+v4.0.4:
+- MAX_SIGNALS = 4 (بدل 8)
+- SIG-XXXX في كل الرسائل
+- SIG-XXXX في Log
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -52,7 +52,7 @@ class Config:
     MIN_ADX = 15.0
     
     MAX_CANDIDATES = 300
-    MAX_SIGNALS = 8
+    MAX_SIGNALS = 4              # ← 4 بدل 8
     MIN_VOLUME = 100_000
     PAPER_TRADING = True
     SCAN_COOLDOWN = 300
@@ -189,7 +189,7 @@ class Analyzer:
                 'rsi_4h': ind4h['rsi'],
                 'alignment_score': alignment,
             }
-        except Exception as e:
+        except:
             return None
     
     def _indicators(self, df):
@@ -385,7 +385,7 @@ class Telegram:
         if not signals:
             return
         
-        msg = f"⚛️ <b>SigmaRadar v4.0</b>\n"
+        msg = f"⚛️ <b>SigmaRadar v4.0.4</b>\n"
         msg += f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
         msg += f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         msg += f"📊 <b>السوق:</b> {regime}\n"
@@ -403,8 +403,9 @@ class Telegram:
     
     def _format(self, s, idx):
         display = f"{s['symbol']}/USDT"
+        trade_id = s.get('trade_id', 0)
         
-        msg = f"<b>{idx}. {display}</b>  ⭐ {s['score']}\n"
+        msg = f"<b>{idx}. SIG-{trade_id:04d} {display}</b>  ⭐ {s['score']}\n"
         msg += f"💰 الدخول: <code>{s['entry']:.6f}</code>\n"
         msg += f"🎯 TP1: <code>{s['tp1']:.6f}</code> (+{s['tp1_pct']}%)\n"
         msg += f"🚀 TP2: <code>{s['tp2']:.6f}</code> (+{s['tp2_pct']}%)\n"
@@ -480,8 +481,9 @@ class SignalGenerator:
         accepted.sort(key=lambda x: -x['score'])
         final = accepted[:Config.MAX_SIGNALS]
         
+        # ✅ حفظ الإشارات مع SIG ID
         for sig in final:
-            storage.save_trade({
+            trade_id = storage.save_trade({
                 'symbol': sig['symbol'],
                 'regime': regime,
                 'score': sig['score'],
@@ -496,8 +498,10 @@ class SignalGenerator:
                     'dd': sig.get('drawdown'),
                 }
             })
-            print(f"  💾 حُفظ {sig['symbol']} في trades")
+            sig['trade_id'] = trade_id
+            print(f"  💾 SIG-{trade_id:04d} {sig['symbol']} في trades")
         
+        # حفظ المرشحات (Shadow)
         for c in candidates:
             storage.save_candidate({
                 'symbol': c['symbol'],
@@ -623,7 +627,7 @@ class SignalGenerator:
 
 
 # ═══════════════════════════════════
-# 8️⃣ التتبع (مع إشعارات!)
+# 8️⃣ التتبع
 # ═══════════════════════════════════
 
 class Tracker:
@@ -665,34 +669,32 @@ class Tracker:
         max_p = max(highs)
         min_p = min(lows)
         
-        # TP2
+        trade_id = trade.get('id', 0)
+        
         if max_p >= trade['tp2']:
             pnl = ((trade['tp2'] - trade['entry']) / trade['entry']) * 100
             storage.close_trade(trade['id'], 'TP2', trade['tp2'], pnl)
-            print(f"  🚀 {trade['symbol']} TP2 (+{pnl:.2f}%)")
+            print(f"  🚀 SIG-{trade_id:04d} {trade['symbol']} TP2 (+{pnl:.2f}%)")
             self._notify(trade, 'TP2', trade['tp2'], pnl, age_hours)
         
-        # TP1
         elif max_p >= trade['tp1']:
             pnl = ((trade['tp1'] - trade['entry']) / trade['entry']) * 100
             storage.close_trade(trade['id'], 'TP1', trade['tp1'], pnl)
-            print(f"  ✅ {trade['symbol']} TP1 (+{pnl:.2f}%)")
+            print(f"  ✅ SIG-{trade_id:04d} {trade['symbol']} TP1 (+{pnl:.2f}%)")
             self._notify(trade, 'TP1', trade['tp1'], pnl, age_hours)
         
-        # SL
         elif min_p <= trade['sl']:
             pnl = ((trade['sl'] - trade['entry']) / trade['entry']) * 100
             storage.close_trade(trade['id'], 'SL', trade['sl'], pnl)
             storage.add_to_blacklist(trade['symbol'], "خسرت في v4.0", permanent=False)
-            print(f"  ❌ {trade['symbol']} SL ({pnl:.2f}%)")
+            print(f"  ❌ SIG-{trade_id:04d} {trade['symbol']} SL ({pnl:.2f}%)")
             self._notify(trade, 'SL', trade['sl'], pnl, age_hours)
         
-        # EXPIRE
         elif age_hours > 48:
             last = ohlcv[-1][4]
             pnl = ((last - trade['entry']) / trade['entry']) * 100
             storage.close_trade(trade['id'], 'EXPIRED', last, pnl)
-            print(f"  ⏰ {trade['symbol']} EXPIRE ({pnl:.2f}%)")
+            print(f"  ⏰ SIG-{trade_id:04d} {trade['symbol']} EXPIRE ({pnl:.2f}%)")
             self._notify(trade, 'EXPIRED', last, pnl, age_hours)
     
     def _notify(self, trade, result, exit_price, pnl, age_hours):
@@ -707,9 +709,11 @@ class Tracker:
             'EXPIRED': '⏰',
         }
         icon = icons.get(result, '📊')
+        trade_id = trade.get('id', 0)
         
-        msg = f"{icon} <b>SigmaRadar v4.0</b>\n"
+        msg = f"{icon} <b>SigmaRadar v4.0.4</b>\n"
         msg += f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        msg += f"🆔 <b>SIG-{trade_id:04d}</b>\n"
         msg += f"<b>{trade['symbol']}/USDT</b> — {result}\n\n"
         msg += f"💰 الدخول: <code>{trade['entry']:.6f}</code>\n"
         msg += f"💵 الخروج: <code>{exit_price:.6f}</code>\n"
@@ -805,18 +809,16 @@ async def run_scan(force: bool = False):
     global _last_scan_time
     
     print(f"\n{'='*60}")
-    print(f"  ⚛️ SigmaRadar v4.0.3")
+    print(f"  ⚛️ SigmaRadar v4.0.4")
     print(f"  🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
     
     exchange = create_exchange()
     
     try:
-        # ✅ 1. التتبع دائماً (بدون Cooldown)
         tracker = Tracker(exchange)
         tracker.track_all()
         
-        # ✅ 2. الفحص فقط عند انتهاء Cooldown
         if not force and time.time() - _last_scan_time < Config.SCAN_COOLDOWN:
             remaining = int(Config.SCAN_COOLDOWN - (time.time() - _last_scan_time))
             print(f"\n⏳ Cooldown للفحص — {remaining}s (لكن التتبع يعمل)")
@@ -824,7 +826,6 @@ async def run_scan(force: bool = False):
         
         _last_scan_time = time.time()
         
-        # 3. الفحص الكامل
         generator = SignalGenerator(exchange)
         result = generator.run()
         
