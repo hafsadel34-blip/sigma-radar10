@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-⚛️ SigmaRadar v4.0 — المنطق الكامل
+⚛️ SigmaRadar v4.0.3 — إشعارات التتبع
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v4.0.2 — إصلاح Rate Limit:
-- max_workers: 4 → 2
-- تأخير عشوائي بين الطلبات
-- retry لمحاولتين لكل عملة
-- Log تفصيلي
+v4.0.3 — الإصلاحات:
+- Tracker يُرسل إشعارات تيليجرام
+- Tracker يعمل بشكل مستقل عن Cooldown
+- Log تفصيلي لكل صفقة مغلقة
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -19,6 +18,7 @@ import ccxt
 import numpy as np
 import pandas as pd
 import aiohttp
+import requests
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -57,11 +57,10 @@ class Config:
     PAPER_TRADING = True
     SCAN_COOLDOWN = 300
     
-    # 🆕 Rate Limit
-    MAX_WORKERS = 2          # من 4 → 2
-    DELAY_MIN = 0.05         # ثانية
-    DELAY_MAX = 0.15         # ثانية
-    RETRY_ATTEMPTS = 2       # محاولات لكل عملة
+    MAX_WORKERS = 2
+    DELAY_MIN = 0.05
+    DELAY_MAX = 0.15
+    RETRY_ATTEMPTS = 2
 
 
 # ═══════════════════════════════════
@@ -144,7 +143,6 @@ class Analyzer:
     
     def analyze(self, symbol):
         try:
-            # 🆕 تأخير عشوائي لمنع Rate Limit
             time.sleep(random.uniform(Config.DELAY_MIN, Config.DELAY_MAX))
             
             o15 = self.exchange.fetch_ohlcv(symbol, '15m', limit=100)
@@ -482,7 +480,6 @@ class SignalGenerator:
         accepted.sort(key=lambda x: -x['score'])
         final = accepted[:Config.MAX_SIGNALS]
         
-        # حفظ الإشارات في trades
         for sig in final:
             storage.save_trade({
                 'symbol': sig['symbol'],
@@ -501,7 +498,6 @@ class SignalGenerator:
             })
             print(f"  💾 حُفظ {sig['symbol']} في trades")
         
-        # حفظ المرشحات (Shadow)
         for c in candidates:
             storage.save_candidate({
                 'symbol': c['symbol'],
@@ -549,63 +545,47 @@ class SignalGenerator:
         return symbols[:Config.MAX_CANDIDATES]
     
     def _process(self, symbol, regime):
-        """معالجة عملة واحدة — مع retry لمنع Rate Limit"""
         base = symbol.split('/')[0]
         
         try:
-            # 1. Blacklist
             if storage.is_blacklisted(base):
                 print(f"  🔍 {base:<10} ⛔ Blacklist")
                 return None
             
-            # 2. تحليل مع retry
             analysis = None
             for attempt in range(Config.RETRY_ATTEMPTS):
                 analysis = self.analyzer.analyze(symbol)
                 if analysis:
                     break
                 if attempt < Config.RETRY_ATTEMPTS - 1:
-                    time.sleep(0.5)  # انتظار قبل retry
+                    time.sleep(0.5)
             
             if not analysis:
                 print(f"  🔍 {base:<10} ❌ بيانات غير كافية")
                 return None
             
-            # 3. إضافة symbol
             analysis['symbol'] = base
             
-            # 4. الفلاتر
             passed, filter_reason = self.filters.check(analysis)
-            
-            # 5. النقاط
             score, reasons, warnings = self.scorer.score(analysis)
             
-            # 6. Logging تفصيلي
             if not passed:
                 print(f"  🔍 {base:<10} ❌ {filter_reason}")
-                return self._build_candidate(
-                    base, regime, analysis, 0, False, filter_reason, [], []
-                )
+                return self._build_candidate(base, regime, analysis, 0, False, filter_reason, [], [])
             
             if score is None:
                 reject_reason = warnings[0] if warnings else "نقاط منخفضة"
                 print(f"  🔍 {base:<10} ❌ {reject_reason}")
-                return self._build_candidate(
-                    base, regime, analysis, 0, False, reject_reason, [], warnings
-                )
+                return self._build_candidate(base, regime, analysis, 0, False, reject_reason, [], warnings)
             
             print(f"  🔍 {base:<10} ✅ مقبول ({score})")
-            return self._build_candidate(
-                base, regime, analysis, score, True, None, reasons, warnings
-            )
+            return self._build_candidate(base, regime, analysis, score, True, None, reasons, warnings)
         
         except Exception as e:
             print(f"  🔍 {base:<10} ⚠️ خطأ: {e}")
             return None
     
-    def _build_candidate(self, base, regime, analysis, score,
-                          accepted, reject_reason, reasons, warnings):
-        """بناء الـ candidate بشكل موحد"""
+    def _build_candidate(self, base, regime, analysis, score, accepted, reject_reason, reasons, warnings):
         candidate = {
             'regime': regime,
             'score': score,
@@ -643,7 +623,7 @@ class SignalGenerator:
 
 
 # ═══════════════════════════════════
-# 8️⃣ التتبع
+# 8️⃣ التتبع (مع إشعارات!)
 # ═══════════════════════════════════
 
 class Tracker:
@@ -685,24 +665,70 @@ class Tracker:
         max_p = max(highs)
         min_p = min(lows)
         
+        # TP2
         if max_p >= trade['tp2']:
             pnl = ((trade['tp2'] - trade['entry']) / trade['entry']) * 100
             storage.close_trade(trade['id'], 'TP2', trade['tp2'], pnl)
             print(f"  🚀 {trade['symbol']} TP2 (+{pnl:.2f}%)")
+            self._notify(trade, 'TP2', trade['tp2'], pnl, age_hours)
+        
+        # TP1
         elif max_p >= trade['tp1']:
             pnl = ((trade['tp1'] - trade['entry']) / trade['entry']) * 100
             storage.close_trade(trade['id'], 'TP1', trade['tp1'], pnl)
             print(f"  ✅ {trade['symbol']} TP1 (+{pnl:.2f}%)")
+            self._notify(trade, 'TP1', trade['tp1'], pnl, age_hours)
+        
+        # SL
         elif min_p <= trade['sl']:
             pnl = ((trade['sl'] - trade['entry']) / trade['entry']) * 100
             storage.close_trade(trade['id'], 'SL', trade['sl'], pnl)
             storage.add_to_blacklist(trade['symbol'], "خسرت في v4.0", permanent=False)
             print(f"  ❌ {trade['symbol']} SL ({pnl:.2f}%)")
+            self._notify(trade, 'SL', trade['sl'], pnl, age_hours)
+        
+        # EXPIRE
         elif age_hours > 48:
             last = ohlcv[-1][4]
             pnl = ((last - trade['entry']) / trade['entry']) * 100
             storage.close_trade(trade['id'], 'EXPIRED', last, pnl)
             print(f"  ⏰ {trade['symbol']} EXPIRE ({pnl:.2f}%)")
+            self._notify(trade, 'EXPIRED', last, pnl, age_hours)
+    
+    def _notify(self, trade, result, exit_price, pnl, age_hours):
+        """إرسال إشعار على تيليجرام"""
+        if not Config.TELEGRAM_TOKEN:
+            return
+        
+        icons = {
+            'TP1': '✅',
+            'TP2': '🚀',
+            'SL': '❌',
+            'EXPIRED': '⏰',
+        }
+        icon = icons.get(result, '📊')
+        
+        msg = f"{icon} <b>SigmaRadar v4.0</b>\n"
+        msg += f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        msg += f"<b>{trade['symbol']}/USDT</b> — {result}\n\n"
+        msg += f"💰 الدخول: <code>{trade['entry']:.6f}</code>\n"
+        msg += f"💵 الخروج: <code>{exit_price:.6f}</code>\n"
+        msg += f"📊 P&L: <b>{pnl:+.2f}%</b>\n"
+        msg += f"⏱️ المدة: {age_hours:.1f}h\n"
+        
+        if trade.get('score'):
+            msg += f"⭐ Score: {trade['score']}\n"
+        if trade.get('regime'):
+            msg += f"📊 Regime: {trade['regime']}\n"
+        
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{Config.TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": Config.TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+                timeout=10
+            )
+        except Exception as e:
+            print(f"⚠️ notify: {e}")
     
     def _track_candidates(self):
         pending = storage.get_pending_candidates()
@@ -778,24 +804,27 @@ def create_exchange():
 async def run_scan(force: bool = False):
     global _last_scan_time
     
-    if not force and time.time() - _last_scan_time < Config.SCAN_COOLDOWN:
-        remaining = int(Config.SCAN_COOLDOWN - (time.time() - _last_scan_time))
-        print(f"⏳ Cooldown — {remaining}s")
-        return None
-    
-    _last_scan_time = time.time()
-    
     print(f"\n{'='*60}")
-    print(f"  ⚛️ SigmaRadar v4.0.2")
+    print(f"  ⚛️ SigmaRadar v4.0.3")
     print(f"  🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
     
     exchange = create_exchange()
     
     try:
+        # ✅ 1. التتبع دائماً (بدون Cooldown)
         tracker = Tracker(exchange)
         tracker.track_all()
         
+        # ✅ 2. الفحص فقط عند انتهاء Cooldown
+        if not force and time.time() - _last_scan_time < Config.SCAN_COOLDOWN:
+            remaining = int(Config.SCAN_COOLDOWN - (time.time() - _last_scan_time))
+            print(f"\n⏳ Cooldown للفحص — {remaining}s (لكن التتبع يعمل)")
+            return None
+        
+        _last_scan_time = time.time()
+        
+        # 3. الفحص الكامل
         generator = SignalGenerator(exchange)
         result = generator.run()
         
